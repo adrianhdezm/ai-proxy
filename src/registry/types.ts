@@ -46,4 +46,21 @@ export interface ModelInfo {
   userDefined?: boolean;
   /** Compatibility handling for configured API-key models. */
   isCompat?: boolean;
+  // --- Additive fields (port of internal registry.ModelInfo fields used by the kept paths) ---
+  /**
+   * Canonical model behind a configured alias (Go: MetadataModelID). Executors resolve an
+   * alias to its upstream id through it. Internal; never exposed in model-list responses.
+   */
+  metadataModelId?: string;
+  /** Whether the Codex/Responses upstream accepts configuration_update input items. Internal. */
+  supportConfigurationUpdate?: boolean;
+  /** Model-specific runtime overrides loaded from models.json ("config"). */
+  config?: ModelConfig;
 }
+
+/** Optional runtime overrides for a model definition (models.json "config"). */
+export interface ModelConfig {
+  /** Upstream request headers forced for this model; keys are header names, values replace any existing header. */
+  overrideHeader?: Record<string, string>;
+}
+
