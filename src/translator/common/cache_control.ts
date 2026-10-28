@@ -57,7 +57,7 @@ export function attachMessageCacheControl<T>(msg: T, src: unknown): T {
     return msg;
   }
   if (typeof content !== "string" || content.trim() === "") return msg;
-  msg.content = [{ type: "text", text: content, cache_control: deepCopy(cc) }];
+  (msg as Record<string, unknown>).content = [{ type: "text", text: content, cache_control: deepCopy(cc) }];
   return msg;
 }
 

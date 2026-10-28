@@ -53,12 +53,12 @@ export function decodeBase64(input: string, opts: Base64Options): Uint8Array | n
         // Padding only allowed in positions 2 and 3 of the final quantum.
         if (j < 2) return null;
         pads++;
+        i++; // consume this '='
         if (j === 2) {
           // next must also be '='
-          if (i + 1 >= n || chars[i + 1] !== 61) return null;
+          if (i >= n || chars[i] !== 61) return null;
           i++;
           pads++;
-          j++;
         }
         break;
       }
