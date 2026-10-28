@@ -1,0 +1,156 @@
+# ai-proxy configuration template.
+# Copy this file to config.yaml, set at least one inbound API key under
+# `access.api-keys`, and either run a login flow (OAuth credentials land in the
+# token store) or add API keys under the *-api-key lists at the bottom.
+#
+# Keys use the upstream CLIProxyAPI spelling (kebab-case). The flat top-level
+# spellings of upstream (host, port, api-keys, auth-dir, proxy-url,
+# request-retry, ...) are still accepted; the nested form below is preferred.
+# Unknown top-level keys are reported as warnings and ignored.
+
+# Listener settings.
+server:
+  # Interface to bind. "" binds all interfaces; use "127.0.0.1" for local-only access.
+  host: ""
+  # Listening port.
+  port: 8317
+  # Maximum inbound request body size in bytes. 0 disables the limit.
+  max-request-body-bytes: 0
+
+# Inbound authentication: clients must present one of these keys
+# (x-api-key header or Authorization: Bearer).
+access:
+  api-keys:
+    - "your-api-key-1"
+    - "your-api-key-2"
+
+# Where OAuth credentials (Claude Code, Codex, Gemini CLI logins) are stored.
+auth:
+  # "file" keeps one JSON document per credential under auth-dir.
+  # "vault" keeps the same documents in HashiCorp Vault KV v2.
+  store: "file"
+
+  # Directory for the file store. "~" expands to the home directory.
+  auth-dir: "~/.ai-proxy"
+
+  # HashiCorp Vault KV v2 settings (only used when store is "vault").
+  # Environment variables override the file: VAULT_ADDR, VAULT_NAMESPACE,
+  # VAULT_TOKEN, VAULT_ROLE_ID, VAULT_SECRET_ID.
+  vault:
+    address: ""                  # e.g. https://vault.example.com:8200
+    namespace: ""                # Vault Enterprise namespace (X-Vault-Namespace), optional
+    mount: "secret"              # KV v2 mount
+    path-prefix: "ai-proxy/auths" # records live at <mount>/data/<path-prefix>/<id>
+    # Either a static token ...
+    token: ""
+    # ... or AppRole credentials (POST /v1/auth/approle/login; re-login once on 403).
+    approle:
+      role-id: ""
+      secret-id: ""
+
+# Credential selection when several credentials can serve a model.
+routing:
+  # round-robin (default) rotates through eligible credentials; fill-first
+  # always prefers the first eligible one.
+  strategy: "round-robin"
+  retry:
+    # Additional credential retry rounds after the first round exhausted its
+    # eligible credentials (upstream `request-retry`). Retries happen on
+    # 403, 408, 500, 502, 503 and 504 responses.
+    max-attempts: 3
+    # Maximum number of different credentials to try per round. 0 = all.
+    max-retry-credentials: 0
+    # Maximum seconds to wait for a cooling credential before the next round.
+    max-retry-interval: 30
+  cooldown:
+    # Disable credential/model cooldown scheduling globally.
+    disabled: false
+    # Cooldown in seconds applied after transient upstream errors
+    # (408/500/502/503/504/52x). 0 keeps the built-in default, negative disables.
+    transient-error-seconds: 0
+
+# Outbound request behaviour.
+requests:
+  # Global proxy for upstream calls. Supports socks5/http/https, e.g.
+  # socks5://user:pass@192.168.1.1:1080/. Per-credential proxy-url overrides it.
+  proxy-url: ""
+  # Forward filtered upstream response headers to clients.
+  passthrough-headers: false
+  # Same setting as routing.retry.max-attempts (upstream name); routing wins
+  # when both are present.
+  # request-retry: 3
+
+# Gemini CLI (OAuth) behaviour when a project quota is exhausted.
+quota-exceeded:
+  switch-project: true        # try another project of the same account
+  switch-preview-model: true  # fall back to a preview model
+
+# Logging. debug: true is shorthand for logging-level: debug and verbose request logs.
+debug: false
+logging-level: "info"         # debug | info | warn | error
+
+# ---------------------------------------------------------------------------
+# API-key credentials. Each entry becomes one credential next to the OAuth
+# logins. Common per-entry fields:
+#   api-key      the upstream key
+#   base-url     upstream endpoint (provider default when omitted)
+#   prefix       require calls like "<prefix>/<model>" to target this entry
+#   label        name used in logs (default "<provider>-apikey")
+#   proxy-url    per-entry proxy override ("direct" bypasses the global proxy)
+#   headers      extra headers sent upstream
+#   weight       routing weight, integer 0..1000000 (default 1, 0 excludes)
+#   priority     routing priority (higher first)
+#   disable-cooling / request-retry   per-entry overrides
+#   excluded-models   patterns hidden from this entry ("gemini-2.5-*", "*-preview")
+#   models       upstream name -> client alias overrides:
+#     - name: "claude-sonnet-4-5"      # upstream model name
+#       alias: "claude-sonnet-latest"  # what clients send
+#       display-name: "Sonnet"         # optional listing name
+#       max-context-length: 200000     # optional context override
+#       is-compat: false               # optional: OpenAI-compatible, non-native model
+# ---------------------------------------------------------------------------
+
+# Anthropic API keys (provider "claude", default base-url https://api.anthropic.com).
+# claude-api-key:
+#   - api-key: "sk-ant-..."
+#   - api-key: "sk-ant-..."
+#     prefix: "team-a"
+#     base-url: "https://gateway.example.com"
+#     label: "team-a gateway"
+#     proxy-url: "socks5://proxy.example.com:1080"
+#     headers:
+#       X-Custom-Header: "custom-value"
+#     models:
+#       - name: "claude-sonnet-4-5"
+#         alias: "claude-sonnet-latest"
+
+# OpenAI platform API keys for the Responses API
+# (provider "openai", default base-url https://api.openai.com/v1).
+# openai-api-key:
+#   - api-key: "sk-..."
+#     models:
+#       - name: "gpt-5"
+#         alias: "gpt-latest"
+
+# Codex backend API keys (provider "codex",
+# default base-url https://chatgpt.com/backend-api/codex, upstream spelling).
+# codex-api-key:
+#   - api-key: "sk-..."
+#     base-url: "https://codex.example.com"
+#     prefix: "codex"
+
+# Google AI Studio API keys (provider "aistudio",
+# default base-url https://generativelanguage.googleapis.com).
+# Entries may be plain strings or mappings; the legacy
+# `generative-language-api-key: [..]` list of strings is merged in as well.
+# gemini-api-key:
+#   - "AIzaSy...01"
+#   - api-key: "AIzaSy...02"
+#     prefix: "test"
+#     base-url: "https://generativelanguage.googleapis.com"
+#     models:
+#       - name: "gemini-2.5-flash"
+#         alias: "gemini-flash"
+#     excluded-models:
+#       - "gemini-2.5-pro"
+#       - "*-preview"
