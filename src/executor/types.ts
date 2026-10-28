@@ -76,8 +76,33 @@ export class StatusError extends Error {
   requestScoped: boolean;
   /** Set when the upstream stream ended before a terminal event. */
   streamTruncated: boolean;
+  /**
+   * Upstream-provided retry delay in milliseconds (Retry-After header,
+   * resets_in_seconds, retryDelay, ...). Undefined when the upstream gave none.
+   */
+  retryAfterMs?: number;
+  /**
+   * The failure applies to the whole credential (e.g. account usage limit),
+   * so every model it serves must be cooled down, not just the requested one.
+   */
+  credentialScoped: boolean;
+  /** A transient capacity/rate-limit rejection that should not escalate the backoff level. */
+  transientRateLimit: boolean;
 
-  constructor(statusCode: number, message: string, opts: { headers?: Headers; body?: string; requestScoped?: boolean; streamTruncated?: boolean; cause?: unknown } = {}) {
+  constructor(
+    statusCode: number,
+    message: string,
+    opts: {
+      headers?: Headers;
+      body?: string;
+      requestScoped?: boolean;
+      streamTruncated?: boolean;
+      retryAfterMs?: number;
+      credentialScoped?: boolean;
+      transientRateLimit?: boolean;
+      cause?: unknown;
+    } = {},
+  ) {
     super(message, opts.cause !== undefined ? { cause: opts.cause } : undefined);
     this.name = "StatusError";
     this.statusCode = statusCode;
@@ -85,6 +110,9 @@ export class StatusError extends Error {
     this.body = opts.body;
     this.requestScoped = opts.requestScoped ?? false;
     this.streamTruncated = opts.streamTruncated ?? false;
+    this.retryAfterMs = opts.retryAfterMs;
+    this.credentialScoped = opts.credentialScoped ?? false;
+    this.transientRateLimit = opts.transientRateLimit ?? false;
   }
 
   /** Mirrors ResponseBody() of the Go StatusError; the body wins over the message. */
