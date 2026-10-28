@@ -84,7 +84,8 @@ describe("RefreshTokensWithRetry", () => {
       calls++;
       return jsonResponse(`{"error":"invalid_grant","code":"refresh_token_reused"}`, 400);
     });
-    const err = await new CodexAuth({ fetch, sleep: noopSleep }).refreshTokensWithRetry("dummy_refresh_token", 3).catch((e) => e as Error);
+    const err = (await new CodexAuth({ fetch, sleep: noopSleep }).refreshTokensWithRetry("dummy_refresh_token", 3).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(Error);
     expect(err.message.toLowerCase()).toContain("refresh_token_reused");
     expect(calls).toBe(1);
   });

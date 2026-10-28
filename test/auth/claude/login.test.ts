@@ -32,7 +32,7 @@ function upstream() {
 function browser(query: (state: string) => string) {
   return (url: string, port: number) => {
     const state = new URL(url).searchParams.get("state") ?? "";
-    void fetch(`http://127.0.0.1:${port}/callback?${query(state)}`, { redirect: "manual" });
+    void fetch(`http://127.0.0.1:${port}/callback?${query(state)}`, { redirect: "manual" }).catch(() => undefined);
   };
 }
 

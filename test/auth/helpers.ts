@@ -20,7 +20,7 @@ export interface FakeFetch extends FetchLike {
 export function fakeFetch(route: Route): FakeFetch {
   const calls: CapturedRequest[] = [];
   const fn = (async (input: string, init?: RequestInit & { proxy?: string; decompress?: boolean }) => {
-    const headers = new Headers(init?.headers as HeadersInit | undefined);
+    const headers = new Headers(init?.headers as ConstructorParameters<typeof Headers>[0]);
     const rawBody = init?.body;
     const body = typeof rawBody === "string" ? rawBody : rawBody instanceof URLSearchParams ? rawBody.toString() : rawBody ? String(rawBody) : "";
     const req: CapturedRequest = { url: input, method: (init?.method ?? "GET").toUpperCase(), headers, body, init };
@@ -68,7 +68,7 @@ export function makeTestCodexJWT(planType: string, accountID: string): string {
 }
 
 export async function compress(bytes: Uint8Array, format: Bun.CompressionFormat): Promise<Uint8Array> {
-  const source = new ReadableStream<Uint8Array>({
+  const source = new ReadableStream<ArrayBufferView | ArrayBuffer>({
     start(controller) {
       controller.enqueue(bytes);
       controller.close();

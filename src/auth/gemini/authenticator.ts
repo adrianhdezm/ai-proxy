@@ -25,7 +25,7 @@ import { generateRandomState } from "../oauth/pkce.ts";
 import { OAuthCallbackServer } from "../oauth/server.ts";
 import type { Authenticator, LoginOptions, RefreshOptions } from "../oauth/types.ts";
 import { type CodeAssistClient, checkCloudAPIIsEnabled, performGeminiCLISetup } from "./code_assist.ts";
-import { DefaultCallbackPort, GeminiAuth, type GeminiEndpoints, type GoogleToken, callbackUrlFor } from "./gemini_auth.ts";
+import { DefaultCallbackPort, GeminiAuth, type GeminiEndpoints, type GeminiOAuthClient, type GoogleToken, callbackUrlFor, resolveGeminiOAuthClient } from "./gemini_auth.ts";
 import { type GeminiTokenMap, type GeminiTokenStorage, credentialFileName, geminiStorageToMetadata } from "./token.ts";
 import { resolveFetch } from "../oauth/http.ts";
 
@@ -33,6 +33,12 @@ export const GeminiCLIProvider = "gemini-cli";
 
 export interface GeminiAuthenticatorOptions {
   callbackPort?: number;
+  /**
+   * OAuth client id/secret. When omitted they are read from
+   * GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET at login/refresh time
+   * (resolveGeminiOAuthClient).
+   */
+  client?: GeminiOAuthClient;
   /** Endpoint overrides (tests). */
   endpoints?: Partial<GeminiEndpoints>;
   /** Run the Service Usage check after onboarding (default true, like upstream). */
@@ -65,11 +71,18 @@ export class GeminiAuthenticator implements Authenticator {
   callbackPort: number;
   private readonly endpoints: Partial<GeminiEndpoints> | undefined;
   private readonly checkCloudAPI: boolean;
+  private readonly client: GeminiOAuthClient | undefined;
 
   constructor(opts: GeminiAuthenticatorOptions = {}) {
     this.callbackPort = opts.callbackPort ?? DefaultCallbackPort;
     this.endpoints = opts.endpoints;
     this.checkCloudAPI = opts.checkCloudAPI ?? true;
+    this.client = opts.client;
+  }
+
+  /** The configured OAuth client, or the one from the environment. */
+  private oauthClient(): GeminiOAuthClient {
+    return this.client ?? resolveGeminiOAuthClient();
   }
 
   /** Upstream returns nil: no proactive refresh schedule; the executor refreshes at expiry. */
@@ -98,7 +111,7 @@ export class GeminiAuthenticator implements Authenticator {
     }
 
     try {
-      const geminiAuth = new GeminiAuth({ fetch: hooks.fetch, proxyUrl: opts.proxyUrl, now, endpoints: this.endpoints });
+      const geminiAuth = new GeminiAuth({ client: this.oauthClient(), fetch: hooks.fetch, proxyUrl: opts.proxyUrl, now, endpoints: this.endpoints });
       const redirectUri = callbackUrlFor(server.port);
       const authUrl = geminiAuth.generateAuthURL(redirectUri, state);
       await announceAuthorizationUrl({ productName: "Gemini", authUrl, callbackPort: server.port, noBrowser: opts.noBrowser ?? false, hooks });
@@ -153,7 +166,7 @@ export class GeminiAuthenticator implements Authenticator {
     const refreshToken = authRefreshToken(auth);
     if (refreshToken === "") return auth;
     const now = opts.now ?? Date.now;
-    const geminiAuth = new GeminiAuth({ fetch: opts.fetch, proxyUrl: opts.proxyUrl ?? auth.proxyUrl, now, endpoints: this.endpoints });
+    const geminiAuth = new GeminiAuth({ client: this.oauthClient(), fetch: opts.fetch, proxyUrl: opts.proxyUrl ?? auth.proxyUrl, now, endpoints: this.endpoints });
     const token = await geminiAuth.refreshToken(refreshToken, opts.signal);
 
     const updated = cloneAuth(auth);

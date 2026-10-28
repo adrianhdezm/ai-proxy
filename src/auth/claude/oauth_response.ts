@@ -5,7 +5,7 @@
 // with `decompress: false` so this decoder sees the wire bytes.
 
 async function pump(bytes: Uint8Array, format: Bun.CompressionFormat): Promise<Uint8Array> {
-  const source = new ReadableStream<Uint8Array>({
+  const source = new ReadableStream<ArrayBufferView | ArrayBuffer>({
     start(controller) {
       controller.enqueue(bytes);
       controller.close();
@@ -61,9 +61,7 @@ export async function readClaudeOAuthResponseBody(resp: Response): Promise<strin
     return text;
   }
   const raw = new Uint8Array(await resp.arrayBuffer());
-  const headerValues = typeof (resp.headers as Headers & { getAll?: (n: string) => string[] }).getAll === "function"
-    ? (resp.headers as Headers & { getAll: (n: string) => string[] }).getAll("content-encoding")
-    : resp.headers.get("content-encoding");
-  const decoded = await decodeClaudeOAuthBody(raw, headerValues);
+  // Repeated Content-Encoding headers are comma-joined by Headers.get.
+  const decoded = await decodeClaudeOAuthBody(raw, resp.headers.get("content-encoding"));
   return new TextDecoder().decode(decoded);
 }
