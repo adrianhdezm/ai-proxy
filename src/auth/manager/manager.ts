@@ -1074,20 +1074,26 @@ export class AuthManager {
     const auth = this.auths.get((id ?? "").trim());
     if (!auth) return undefined;
     const now = this.now();
-    auth.unavailable = false;
-    auth.status = StatusActive;
-    auth.statusMessage = undefined;
-    auth.lastError = undefined;
-    auth.nextRetryAfter = 0;
-    auth.quota = emptyQuotaState();
-    for (const state of Object.values(auth.modelStates ?? {})) {
+    const registeredModels = this.registry.getModelsForClient(auth.id).map((m) => m.id);
+    let models: string[] = [];
+    for (const [modelKey, state] of Object.entries(auth.modelStates ?? {})) {
+      if (modelKey.trim() === "") continue;
+      models.push(modelKey);
       if (state) resetModelState(state, now);
+    }
+    if (!clearCooldownStateForAuth(auth, now) && auth.modelStates && Object.keys(auth.modelStates).length > 0) updateAggregatedAvailability(auth, now);
+    if (models.length === 0) models = registeredModels.slice();
+    models = Array.from(new Set(models));
+    // A terminal unauthorized credential stays blocked until its tokens change.
+    if (!auth.disabled && auth.status !== StatusDisabled && !hasModelError(auth, now) && !hasUnauthorizedAuthFailure(auth)) {
+      auth.lastError = undefined;
+      auth.statusMessage = undefined;
+      auth.status = StatusActive;
     }
     auth.updatedAt = now;
     this.authCooldownSeq.delete(auth.id);
     this.modelCooldownSeq.delete(auth.id);
-    const models = this.registry.getModelsForClient(auth.id).map((m) => m.id);
-    for (const model of models) {
+    for (const model of registeredModels) {
       this.registry.clearModelQuotaExceeded(auth.id, model);
       this.registry.resumeClientModel(auth.id, model);
     }

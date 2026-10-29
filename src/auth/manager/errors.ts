@@ -245,18 +245,16 @@ export function isInvalidGrantResultError(err: AuthError | undefined): boolean {
 }
 
 const modelSupportPatterns = [
-  "model not found",
-  "model_not_found",
-  "unknown model",
-  "unsupported model",
+  "model_not_supported",
+  "requested model is not supported",
+  "requested model is unsupported",
+  "requested model is unavailable",
   "model is not supported",
-  "not supported by this model",
-  "does not support",
-  "is not available for this model",
-  "model does not exist",
-  "does not exist or you do not have access",
-  "model not available",
-  "no such model",
+  "model not supported",
+  "unsupported model",
+  "model unavailable",
+  "not available for your plan",
+  "not available for your account",
 ];
 
 /** Message patterns of a credential/model capability mismatch (Go: isModelSupportErrorMessage). */

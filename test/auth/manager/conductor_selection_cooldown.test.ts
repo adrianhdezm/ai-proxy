@@ -5,7 +5,7 @@
 // sanitiser table; only the JSON summary extraction and the token/key redactions are ported).
 import { expect, test } from "bun:test";
 import { AuthManagerError, FillFirstSelector, ModelCooldownError, RoundRobinSelector, extractUpstreamErrorSummary, getAvailableAuths, safeResponseHeaders } from "../../../src/auth/manager/index.ts";
-import { StatusActive, StatusError } from "../../../src/auth/types.ts";
+import { StatusError } from "../../../src/auth/types.ts";
 import { Hour, Minute, auth, baseNow, opts } from "./helpers.ts";
 
 function pickError(fn: () => unknown): unknown {
@@ -17,16 +17,13 @@ function pickError(fn: () => unknown): unknown {
   return undefined;
 }
 
+// Upstream hands the built-in selectors an empty model (selectionArgForSelector) and restores the route
+// model on the error afterwards; the port passes the route model straight through, so the credential-wide
+// cooldown is expressed without an unrelated model state here.
 test("BuiltInSelectorCooldownErrorPreservesRouteModel", () => {
   const routeModel = "client-opus(high)";
   const next = baseNow + Hour;
-  const a = auth({
-    id: "cooling-auth",
-    unavailable: true,
-    nextRetryAfter: next,
-    quota: { exceeded: true, nextRecoverAt: next },
-    modelStates: { "other-model": { status: StatusActive, unavailable: false, nextRetryAfter: 0, quota: { exceeded: false, nextRecoverAt: 0 }, updatedAt: 0 } },
-  });
+  const a = auth({ id: "cooling-auth", unavailable: true, nextRetryAfter: next, quota: { exceeded: true, nextRecoverAt: next } });
   for (const selector of [new RoundRobinSelector(), new FillFirstSelector()]) {
     const err = pickError(() => selector.pick("mixed", routeModel, opts(), [a], baseNow));
     expect(err).toBeInstanceOf(ModelCooldownError);

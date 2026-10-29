@@ -3,7 +3,7 @@
 // snapshot (the TS store has no file snapshot binding); the tryRefreshAfterUnauthorized assertion of
 // TestManager_ConcurrentUnauthorized_BarrierExecutionPreservesTerminalState is covered through refreshAuth.
 import { expect, test } from "bun:test";
-import { hasUnauthorizedAuthFailure, authAccessToken } from "../../../src/auth/manager/index.ts";
+import { FillFirstSelector, hasUnauthorizedAuthFailure, authAccessToken } from "../../../src/auth/manager/index.ts";
 import { StatusActive, StatusError, type Auth } from "../../../src/auth/types.ts";
 import { Hour, auth, deferred, fakeExecutor, newManager, opts, registerModels, req, statusError, streamOf, type FakeExecutor, type TestManager } from "./helpers.ts";
 
@@ -133,7 +133,7 @@ test("Manager_ConcurrentUnauthorized_BarrierExecutionPreservesTerminalState", as
     },
   };
   const executor = unauthorizedRefreshExecutor(spec);
-  const tm = newManager();
+  const tm = newManager({ selector: new FillFirstSelector() });
   tm.manager.registerExecutor(executor);
   registerModels(tm.registry, primary.id, "codex", model);
   registerModels(tm.registry, backup.id, "codex", model);
