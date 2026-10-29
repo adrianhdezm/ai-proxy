@@ -97,10 +97,11 @@ export function convertOpenAIResponseToClaude(
   rawJSON: string,
   state: TranslatorState,
 ): string[] {
-  if (!(state.value instanceof ConvertOpenAIResponseToAnthropicParams)) {
-    state.value = new ConvertOpenAIResponseToAnthropicParams();
+  let param = state.value as ConvertOpenAIResponseToAnthropicParams | undefined;
+  if (!(param instanceof ConvertOpenAIResponseToAnthropicParams)) {
+    param = new ConvertOpenAIResponseToAnthropicParams();
+    state.value = param;
   }
-  const param = state.value;
 
   if (!rawJSON.startsWith("data:")) return [];
   rawJSON = rawJSON.slice(5).trim();
