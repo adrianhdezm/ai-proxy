@@ -50,7 +50,7 @@ import {
 import type { ClaudeHeaderDefaults } from "./device_profile.ts";
 import { classifyClaudeUpstreamErrorWithCooling } from "./errors.ts";
 import { applyClaudeHeaders } from "./headers.ts";
-import { applyClaudeCLIIdentity, claudeAgentSessionUUIDForRequest } from "./identity.ts";
+import { applyClaudeCLIIdentity, claudeAgentSessionUUIDForRequest, validateClaudeMetadataUnique } from "./identity.ts";
 import {
   applyRequestThinking,
   disableThinkingIfToolChoiceForced,
@@ -166,6 +166,8 @@ export class ClaudeExecutor implements ProviderExecutor {
     const [wirePolicy] = resolveClaudeWirePolicy(this.cfg, auth, apiKey, detection.confirmed);
     const confirmedClaudeCode = isEffectiveConfirmedClaudeCode(detection, wirePolicy);
     const sessionID = fp.profileClaudeCodeCLI || wirePolicy.cloak ? claudeAgentSessionUUIDForRequest(incomingHeaders, originalPayload, req.payload, confirmedClaudeCode, opts.metadata, req.metadata) : "";
+    // The credential identity rewrite must see the only metadata object the caller sent.
+    if (fp.applyCLIIdentity) validateClaudeMetadataUnique(req.payload);
 
     let body = translateRequest(from, to, baseModel, req.payload, upstreamStream);
     body = setStringIfDifferent(body, "model", upstreamModel);
@@ -316,7 +318,7 @@ export class ClaudeExecutor implements ProviderExecutor {
   async refresh(auth: Auth): Promise<Auth> {
     log.debug("claude executor: refresh called");
     if (isAPIKeyAuth(auth)) return auth;
-    return new ClaudeAuthenticator().refresh(auth, { proxyUrl: auth.proxyUrl ?? this.cfg.proxyUrl });
+    return new ClaudeAuthenticator().refresh(auth, { proxyUrl: auth.proxyUrl ?? this.cfg.proxyUrl, fetch: this.cfg.fetch, now: this.cfg.now });
   }
 }
 

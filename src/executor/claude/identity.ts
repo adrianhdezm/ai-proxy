@@ -156,3 +156,54 @@ export function applyClaudeCLIIdentity(body: string, auth: Auth, seed: string, s
   (root.metadata as Record<string, unknown>).user_id = userID;
   return JSON.stringify(root);
 }
+
+/**
+ * Whether a JSON object text repeats the top-level member `target` (Go:
+ * uniqueClaudeJSONObjectMember's duplicate check). JSON.parse silently keeps the
+ * last duplicate, which would let a caller smuggle a second metadata object past
+ * the credential identity rewrite.
+ */
+export function hasDuplicateTopLevelJSONKey(raw: string, target: string): boolean {
+  let depth = 0;
+  let rootIsObject = false;
+  let expectKey = false;
+  let seen = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < raw.length && raw[j] !== '"') j += raw[j] === "\\" ? 2 : 1;
+      if (depth === 1 && rootIsObject && expectKey) {
+        let key: unknown;
+        try {
+          key = JSON.parse(raw.slice(i, j + 1));
+        } catch {
+          return false;
+        }
+        if (key === target && ++seen > 1) return true;
+        expectKey = false;
+      }
+      i = j;
+      continue;
+    }
+    if (c === "{" || c === "[") {
+      depth++;
+      if (depth === 1) {
+        rootIsObject = c === "{";
+        expectKey = rootIsObject;
+      }
+    } else if (c === "}" || c === "]") {
+      depth--;
+    } else if (c === "," && depth === 1) {
+      expectKey = rootIsObject;
+    }
+  }
+  return false;
+}
+
+/** Rejects a Messages body that carries `metadata` more than once (request-scoped 400). */
+export function validateClaudeMetadataUnique(payload: string): void {
+  if (hasDuplicateTopLevelJSONKey(payload, "metadata")) {
+    throw new StatusError(400, `apply Claude credential metadata: duplicate JSON object key "metadata"`, { requestScoped: true });
+  }
+}

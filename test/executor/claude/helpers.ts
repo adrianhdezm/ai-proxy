@@ -162,3 +162,30 @@ export const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 export const HOUR = 60 * 60_000;
 export const DAY = 24 * HOUR;
 export const SECOND = 1000;
+
+/** Response body of a minimal successful non-stream Messages call. */
+export const okMessage = (model = "claude-3-5-sonnet") =>
+  `{"id":"msg_1","type":"message","model":"${model}","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`;
+
+/** Runs `fn` against a fake upstream and always stops the server afterwards. */
+export async function withUpstream<T>(handler: UpstreamHandler, fn: (upstream: FakeUpstream) => Promise<T>): Promise<T> {
+  const upstream = startUpstream(handler);
+  try {
+    return await fn(upstream);
+  } finally {
+    upstream.stop();
+  }
+}
+
+/** Parses the last captured upstream request body. */
+export function lastBody(upstream: FakeUpstream): Record<string, any> {
+  const last = upstream.requests[upstream.requests.length - 1];
+  if (!last) throw new Error("no upstream request captured");
+  return JSON.parse(last.body);
+}
+
+export function lastHeaders(upstream: FakeUpstream): Headers {
+  const last = upstream.requests[upstream.requests.length - 1];
+  if (!last) throw new Error("no upstream request captured");
+  return last.headers;
+}
