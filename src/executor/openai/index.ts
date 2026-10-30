@@ -326,11 +326,6 @@ export class OpenAICompatExecutor implements ProviderExecutor {
 
     // Returns the translated frames of one upstream event, or throws the stream error.
     const processFrame = (ev: SSEEvent): { chunks: string[]; done: boolean } => {
-      // A bare JSON line outside the SSE framing is an error body on a 2xx stream.
-      for (const rawLine of ev.raw.split(/\r\n|\n|\r/)) {
-        const trimmed = rawLine.trim();
-        if (trimmed.startsWith("{") || trimmed.startsWith("[")) throw new StatusError(502, trimmed, { body: trimmed });
-      }
       const eventName = ev.event;
       const dataLines = ev.data === "" && !/^\s*data:/m.test(ev.raw) ? [] : ev.data.split("\n");
       if (dataLines.length === 0) {
@@ -358,6 +353,32 @@ export class OpenAICompatExecutor implements ProviderExecutor {
     if (!body) throw new StatusError(502, "upstream stream closed before [DONE]");
     const reader = body.getReader();
     const parser = new SSEParser();
+    const decoder = new TextDecoder();
+    let lineBuffer = "";
+    // Feeds complete lines to the SSE parser. A bare JSON line outside the SSE
+    // framing is an error body on a 2xx stream (Go: the "{" / "[" line check).
+    const feedLines = (text: string, final: boolean): SSEEvent[] => {
+      lineBuffer += text;
+      const events: SSEEvent[] = [];
+      const consume = (line: string): void => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) throw new StatusError(502, trimmed, { body: trimmed });
+        events.push(...parser.push(line));
+      };
+      for (;;) {
+        const idx = lineBuffer.indexOf("\n");
+        if (idx < 0) break;
+        const line = lineBuffer.slice(0, idx + 1);
+        lineBuffer = lineBuffer.slice(idx + 1);
+        consume(line);
+      }
+      if (final && lineBuffer !== "") {
+        const rest = lineBuffer;
+        lineBuffer = "";
+        consume(rest);
+      }
+      return events;
+    };
     const onAbort = () => {
       reader.cancel().catch(() => {});
     };
@@ -374,7 +395,7 @@ export class OpenAICompatExecutor implements ProviderExecutor {
           break;
         }
         if (result.done) break;
-        for (const ev of parser.push(result.value)) {
+        for (const ev of feedLines(decoder.decode(result.value, { stream: true }), false)) {
           const out = processFrame(ev);
           for (const chunk of out.chunks) yield chunk;
           if (out.done) {
@@ -384,7 +405,7 @@ export class OpenAICompatExecutor implements ProviderExecutor {
         }
       }
       if (!finished && readError === undefined && !seenDone) {
-        for (const ev of parser.flush()) {
+        for (const ev of [...feedLines(decoder.decode(), true), ...parser.flush()]) {
           const out = processFrame(ev);
           for (const chunk of out.chunks) yield chunk;
           if (out.done) break;

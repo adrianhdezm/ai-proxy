@@ -3,6 +3,7 @@
 // gemini_cli_executor.go and current gemini_executor.go (line scanner ->
 // response translator -> "[DONE]" flush), without the usage reporter and the
 // apply_patch tool-input machinery.
+import type { FetchLike } from "../../auth/oauth/http.ts";
 import { log } from "../../log.ts";
 import { defaultRegistry } from "../../translator/registry.ts";
 import { FormatClaude, FormatGemini, FormatOpenAI, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
@@ -16,7 +17,7 @@ import {
 } from "./errors.ts";
 
 /** fetch as used by the executors (Bun's `proxy` option is honoured). */
-export type ExecutorFetch = (input: string, init?: RequestInit & { proxy?: string }) => Promise<Response>;
+export type ExecutorFetch = FetchLike;
 
 export interface UpstreamRequest {
   url: string;
