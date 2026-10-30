@@ -83,7 +83,7 @@ export class ClaudeCodeAPIHandler {
   async claudeMessages(request: Request, rawJSON: string): Promise<Response> {
     const parsed = parseRequestBody(rawJSON);
     if ("error" in parsed) return this.errorResponse(parsed.error);
-    const body = rewriteClaudeDDModelInBody(parsed.body, parsed.raw);
+    const body = rewriteClaudeDDModelInBody(parsed.object, parsed.raw);
     const stream = body.object.stream === true;
     if (!stream) return this.handleNonStreamingResponse(request, body);
     return this.handleStreamingResponse(request, body);
@@ -93,7 +93,7 @@ export class ClaudeCodeAPIHandler {
   async claudeCountTokens(request: Request, rawJSON: string): Promise<Response> {
     const parsed = parseRequestBody(rawJSON);
     if ("error" in parsed) return this.errorResponse(parsed.error);
-    const body = rewriteClaudeDDModelInBody(parsed.body, parsed.raw);
+    const body = rewriteClaudeDDModelInBody(parsed.object, parsed.raw);
     const prepared = this.prepareExecution(request, body, false);
     if ("error" in prepared) return this.errorResponse(prepared.error);
     let resp: ExecResponse;

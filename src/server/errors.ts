@@ -8,10 +8,10 @@ import {
   ModelCooldownError,
   TerminalAuthError,
   extractUpstreamErrorSummary,
-  isClaudeThreadNotFound,
   isStreamTruncatedError,
   safeResponseHeaders,
 } from "../auth/manager/index.ts";
+import { isClaudeThreadNotFound } from "../auth/manager/errors.ts";
 import { StatusError, statusCodeOf, type ErrorMessage } from "../executor/types.ts";
 import { isObject, tryParse } from "../util/json.ts";
 import { isCPAReservedResponseHeader } from "./headers.ts";
@@ -202,8 +202,8 @@ export function claudeErrorDetailFromText(status: number, errText: string): { ty
  *
  * Deviation from upstream: a truncated stream or transport failure
  * (StatusError.streamTruncated / the manager's stream_truncated code) is never
- * reported as invalid_request_error. Its status is lifted to 502 unless it is
- * already a 5xx or a timeout (408), so the client sees a retryable api_error.
+ * reported as invalid_request_error (or timeout_error): its status is lifted to
+ * 502 unless it is already a 5xx, so the client sees a retryable api_error.
  */
 export function toClaudeError(msg: ErrorMessage | undefined | null): ClaudeErrorResponse {
   let status = 500;
@@ -220,7 +220,7 @@ export function toClaudeError(msg: ErrorMessage | undefined | null): ClaudeError
       if (text !== "") errText = text;
     }
   }
-  if (truncated && status < 500 && status !== 408) status = 502;
+  if (truncated && status < 500) status = 502;
   const detail = claudeErrorDetailFromText(status, errText);
   if (truncated && detail.type === "invalid_request_error") detail.type = "api_error";
   const response: ClaudeErrorResponse = { type: "error", error: { type: detail.type, message: detail.message } };

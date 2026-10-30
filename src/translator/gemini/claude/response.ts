@@ -128,6 +128,14 @@ function partThoughtSignature(part: unknown): string {
 
 const sseTrailingNewlines = 3;
 
+/** Returns the per-stream state stored in `state.value`, creating it on the first chunk (Go: *param == nil). */
+function streamState(state: TranslatorState, originalRequestRawJSON: string): GeminiClaudeStreamState {
+  if (state.value instanceof GeminiClaudeStreamState) return state.value;
+  const created = new GeminiClaudeStreamState(originalRequestRawJSON);
+  state.value = created;
+  return created;
+}
+
 /**
  * Streaming Gemini -> Claude SSE conversion (Go: ConvertGeminiResponseToClaude).
  * Returns zero or more strings, each holding complete Claude SSE frames.
@@ -140,8 +148,7 @@ export function convertGeminiResponseToClaude(
   rawJSON: string,
   state: TranslatorState,
 ): string[] {
-  if (!(state.value instanceof GeminiClaudeStreamState)) state.value = new GeminiClaudeStreamState(originalRequestRawJSON);
-  const p = state.value;
+  const p = streamState(state, originalRequestRawJSON);
 
   let output = "";
   const appendEvent = (event: string, payload: string): void => {
