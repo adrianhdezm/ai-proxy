@@ -82,8 +82,11 @@ export class ConvertCodexResponseToClaudeParams {
 }
 
 function paramsFor(state: TranslatorState): ConvertCodexResponseToClaudeParams {
-  if (!(state.value instanceof ConvertCodexResponseToClaudeParams)) state.value = new ConvertCodexResponseToClaudeParams();
-  return state.value;
+  const existing = state.value;
+  if (existing instanceof ConvertCodexResponseToClaudeParams) return existing;
+  const params = new ConvertCodexResponseToClaudeParams();
+  state.value = params;
+  return params;
 }
 
 function sse(output: string, event: string, payload: unknown): string {
