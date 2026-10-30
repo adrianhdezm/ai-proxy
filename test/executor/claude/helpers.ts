@@ -127,10 +127,11 @@ export async function expectStatusError(p: Promise<unknown>): Promise<StatusErro
 }
 
 export function gzip(data: string | Uint8Array): Uint8Array {
-  return new Uint8Array(Bun.gzipSync(typeof data === "string" ? new TextEncoder().encode(data) : data));
+  return new Uint8Array(Bun.gzipSync(typeof data === "string" ? new TextEncoder().encode(data) : (new Uint8Array(data) as Uint8Array<ArrayBuffer>)));
 }
 
-export function encodeBody(encoding: string, plain: Uint8Array): Uint8Array {
+export function encodeBody(encoding: string, input: Uint8Array): Uint8Array {
+  const plain = new Uint8Array(input) as Uint8Array<ArrayBuffer>;
   switch (encoding) {
     case "gzip":
       return new Uint8Array(Bun.gzipSync(plain));
