@@ -323,6 +323,11 @@ export class OpenAICompatExecutor implements ProviderExecutor {
 
     let seenDone = false;
     let sawFinishReason = false;
+    // Non-empty downstream chunks yielded so far. A stream that reaches its
+    // terminal marker without any is a failed attempt (502) so the auth manager
+    // can fail over instead of handing the client a stream with no message_start.
+    let emitted = 0;
+    const noOutputError = (): StatusError => new StatusError(502, "upstream stream ended without output");
 
     // Returns the translated frames of one upstream event, or throws the stream error.
     const processFrame = (ev: SSEEvent): { chunks: string[]; done: boolean } => {
@@ -338,6 +343,7 @@ export class OpenAICompatExecutor implements ProviderExecutor {
       const dataPayload = dataLines.map((l) => l.trim()).join("\n").trim();
       const isDone = dataPayload === "[DONE]";
       if (isDone && openAICompatErrorEvent(eventName)) throw new StatusError(502, "upstream error event ended before [DONE]");
+      if (isDone && emitted === 0) throw noOutputError();
       if (!isDone && tryParse(dataPayload) === undefined) throw new StatusError(502, "upstream stream ended with incomplete SSE data frame");
       if (!isDone) {
         const streamErr = openAICompatStreamDataError(dataPayload, eventName);
@@ -397,7 +403,11 @@ export class OpenAICompatExecutor implements ProviderExecutor {
         if (result.done) break;
         for (const ev of feedLines(decoder.decode(result.value, { stream: true }), false)) {
           const out = processFrame(ev);
-          for (const chunk of out.chunks) yield chunk;
+          for (const chunk of out.chunks) {
+            if (chunk === "") continue;
+            emitted++;
+            yield chunk;
+          }
           if (out.done) {
             finished = true;
             break;
@@ -407,7 +417,11 @@ export class OpenAICompatExecutor implements ProviderExecutor {
       if (!finished && readError === undefined && !seenDone) {
         for (const ev of [...feedLines(decoder.decode(), true), ...parser.flush()]) {
           const out = processFrame(ev);
-          for (const chunk of out.chunks) yield chunk;
+          for (const chunk of out.chunks) {
+            if (chunk === "") continue;
+            emitted++;
+            yield chunk;
+          }
           if (out.done) break;
         }
       }
@@ -420,8 +434,11 @@ export class OpenAICompatExecutor implements ProviderExecutor {
       // Without a translator-confirmed terminal state, a clean Claude EOF without
       // [DONE] remains a failed stream instead of completing it.
       if (responseFormat === FormatClaude && !sawFinishReason) throw new StatusError(502, "upstream stream closed before [DONE]");
+      if (emitted === 0) throw noOutputError();
       // Providers that omit [DONE] after the finish_reason: flush the terminal frames.
-      for (const chunk of translate("data: [DONE]")) yield chunk;
+      for (const chunk of translate("data: [DONE]")) {
+        if (chunk !== "") yield chunk;
+      }
     } finally {
       opts.signal?.removeEventListener("abort", onAbort);
       try {

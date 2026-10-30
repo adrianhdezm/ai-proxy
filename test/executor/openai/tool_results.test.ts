@@ -2,6 +2,8 @@
 // Ported from: internal/runtime/executor/helps/openai_compat_tool_results_test.go
 // Skipped cases: none. The per-model input-modalities option is read from the credential's
 //   model overrides (`inputModalities`) instead of config.OpenAICompatibility.Models.
+//   The stream fixture sends one content chunk before [DONE] (Go sent a bare [DONE], which this
+//   executor rejects as a stream without output).
 import { afterAll, describe, expect, test } from "bun:test";
 import {
   OpenAICompatExecutor,
@@ -40,7 +42,7 @@ const toolResultPayload = JSON.stringify({
 
 async function run(stream: boolean, inputModalities: string[] | undefined): Promise<string> {
   upstream.requests.length = 0;
-  upstream.respond(() => (stream ? sseResponse("data: [DONE]\n\n") : jsonResponse(simpleChatCompletion)));
+  upstream.respond(() => (stream ? sseResponse('data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n') : jsonResponse(simpleChatCompletion)));
   const cfg = configWithModels([modelOverride({ name: "mapped-model", alias: "claude-client", inputModalities })]);
   const executor = new OpenAICompatExecutor(cfg);
   const auth = apiKeyAuth({ baseURL: upstream.baseURL, apiKey: "test", configIndex: 0 });

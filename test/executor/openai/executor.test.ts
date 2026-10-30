@@ -1,8 +1,9 @@
 // New (no upstream test): end-to-end OpenAICompatExecutor behaviour against a fake
 // chat.completions server — Claude inbound non-stream (text + tool call), a streaming
 // Claude SSE sequence ending in message_stop, upstream 429 with Retry-After, stream
-// truncation (before any output, after output without finish_reason, after finish_reason
-// without [DONE]), in-stream error payloads, request headers, countTokens and refresh.
+// truncation (before any output, [DONE]-only, dropped connection, after output without
+// finish_reason, after finish_reason without [DONE]), in-stream error payloads, request
+// headers, countTokens and refresh.
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { OpenAICompatExecutor, createOpenAIExecutor } from "../../../src/executor/openai/index.ts";
 import { StatusError } from "../../../src/executor/types.ts";
@@ -163,6 +164,52 @@ describe("executeStream", () => {
     expect((error as StatusError).statusCode).toBe(502);
     expect((error as StatusError).message).toBe("upstream stream closed before [DONE]");
     expect((error as StatusError).streamTruncated).toBe(false);
+  });
+
+  test("a [DONE]-only stream (no output at all) is a 502 instead of a stream without message_start", async () => {
+    upstream.respond(() => sseResponse("data: [DONE]\n\n"));
+    const result = await executor.executeStream(auth, { model: "gpt-4o", payload: claudeRequest(true), format: FormatClaude }, { stream: true, sourceFormat: FormatClaude });
+    const { chunks, error } = await drain(result);
+    expect(chunks).toEqual([]);
+    expect(error).toBeInstanceOf(StatusError);
+    expect((error as StatusError).statusCode).toBe(502);
+    expect((error as StatusError).message).toBe("upstream stream ended without output");
+  });
+
+  test("a connection dropped mid-body before any output is a 502", async () => {
+    // Raw TCP upstream: valid chunked 200 headers and a keepalive comment, then the socket closes
+    // without the terminating chunk, so the body read fails.
+    const raw = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(socket) {
+          const comment = ": keepalive\n\n";
+          socket.write(`HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n${comment.length.toString(16)}\r\n${comment}\r\n`);
+          socket.end();
+        },
+      },
+    });
+    try {
+      const rawAuth = apiKeyAuth({ baseURL: `http://127.0.0.1:${raw.port}/v1`, apiKey: "sk-test" });
+      const result = await executor.executeStream(rawAuth, { model: "gpt-4o", payload: claudeRequest(true), format: FormatClaude }, { stream: true, sourceFormat: FormatClaude });
+      const { chunks, error } = await drain(result);
+      expect(chunks).toEqual([]);
+      expect(error).toBeInstanceOf(StatusError);
+      expect((error as StatusError).statusCode).toBe(502);
+    } finally {
+      raw.stop(true);
+    }
+  });
+
+  test("no yielded chunk is ever empty", async () => {
+    upstream.respond(() => sseChunkedResponse([": keepalive\n\n", 'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n', 'data: {"choices":[{"index":0,"delta":{}}]}\n\n', textChunks, finishChunk, "data: [DONE]\n\n"]));
+    const result = await executor.executeStream(auth, { model: "gpt-4o", payload: claudeRequest(true), format: FormatClaude }, { stream: true, sourceFormat: FormatClaude });
+    const { chunks, error } = await drain(result);
+    expect(error).toBeUndefined();
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(chunks.every((c) => c.length > 0)).toBe(true);
+    expect(parseClaudeEvents(chunks).map((e) => e.type)[0]).toBe("message_start");
   });
 
   test("stream cut after output but before finish_reason fails with 502 (upstream behaviour for Claude clients)", async () => {
