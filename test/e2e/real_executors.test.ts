@@ -1,14 +1,14 @@
 // New (no upstream test): end-to-end through the real stack. The HTTP server,
 // AuthManager and the real executors from createExecutors(config) are driven
 // with Claude Messages requests against fake upstream servers on Bun.serve
-// port 0: Anthropic (passthrough + 429 failover), OpenAI chat completions and
-// Gemini AI Studio (both translated back to Claude).
+// port 0: Anthropic (passthrough + 429 failover), OpenAI chat completions,
+// the Codex Responses backend and Gemini AI Studio (translated back to Claude).
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { createApp } from "../../src/app.ts";
 import type { Auth } from "../../src/auth/types.ts";
 import { defaultConfig } from "../../src/config/load.ts";
 import type { ApiKeyCredential, Config } from "../../src/config/types.ts";
-import { ModelRegistry, getAIStudioModels, getClaudeModels } from "../../src/registry/index.ts";
+import { ModelRegistry, getAIStudioModels, getClaudeModels, getCodexProModels } from "../../src/registry/index.ts";
 import type { PersistingTokenStore } from "../../src/store/index.ts";
 
 class MemoryStore implements PersistingTokenStore {
@@ -29,6 +29,8 @@ function credential(partial: Partial<ApiKeyCredential> & { apiKey: string }): Ap
 const claudeModel = getClaudeModels()[0]!.id;
 const geminiModel = getAIStudioModels()[0]!.id;
 const openaiModel = "gpt-test-chat";
+const codexModel = getCodexProModels()[0]!.id;
+const codexHits: string[] = [];
 
 const anthropicHits: string[] = [];
 const sse = (frames: Array<[string, unknown]>) => frames.map(([e, d]) => `event: ${e}\ndata: ${JSON.stringify(d)}\n\n`).join("");
@@ -47,6 +49,7 @@ function claudeStream(model: string): string {
 let anthropic: ReturnType<typeof Bun.serve>;
 let openai: ReturnType<typeof Bun.serve>;
 let gemini: ReturnType<typeof Bun.serve>;
+let codex: ReturnType<typeof Bun.serve>;
 
 beforeAll(() => {
   anthropic = Bun.serve({
@@ -94,6 +97,32 @@ beforeAll(() => {
       });
     },
   });
+  codex = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const key = (req.headers.get("authorization") ?? "").replace(/^Bearer /, "");
+      codexHits.push(key);
+      const body = (await req.json()) as { model: string };
+      const ev = (d: unknown) => `data: ${JSON.stringify(d)}\n\n`;
+      if (key === "sk-codex-limited") {
+        const err = { type: "usage_limit_reached", message: "You've hit your usage limit.", resets_in_seconds: 3600 };
+        return new Response(ev({ type: "response.created", response: { id: "r0", model: body.model } }) + ev({ type: "error", status: 429, error: err }), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
+      const item = { id: "msg_c", type: "message", role: "assistant", content: [{ type: "output_text", text: "hello from codex" }] };
+      return new Response(
+        ev({ type: "response.created", response: { id: "r1", model: body.model } }) +
+          ev({ type: "response.output_item.added", output_index: 0, item: { id: "msg_c", type: "message", role: "assistant", content: [] } }) +
+          ev({ type: "response.content_part.added", output_index: 0, content_index: 0, item_id: "msg_c", part: { type: "output_text", text: "" } }) +
+          ev({ type: "response.output_text.delta", output_index: 0, content_index: 0, item_id: "msg_c", delta: "hello from codex" }) +
+          ev({ type: "response.output_text.done", output_index: 0, content_index: 0, item_id: "msg_c", text: "hello from codex" }) +
+          ev({ type: "response.output_item.done", output_index: 0, item }) +
+          ev({ type: "response.completed", response: { id: "r1", model: body.model, status: "completed", output: [item], usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } } }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
   gemini = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -116,6 +145,7 @@ afterAll(() => {
   anthropic?.stop(true);
   openai?.stop(true);
   gemini?.stop(true);
+  codex?.stop(true);
 });
 
 function config(): Config {
@@ -128,6 +158,12 @@ function config(): Config {
     credential({ apiKey: "sk-ant-healthy", baseUrl: anthropicBase }),
   ];
   cfg.openaiApiKeys = [credential({ apiKey: "sk-openai", baseUrl: `http://127.0.0.1:${openai.port}/v1`, models: [{ name: openaiModel, alias: "", displayName: "", maxContextLength: 0, isCompat: false, forceMapping: false }] })];
+  const codexBase = `http://127.0.0.1:${codex.port}`;
+  const codexModels = [{ name: codexModel, alias: "", displayName: "", maxContextLength: 0, isCompat: false, forceMapping: false }];
+  cfg.codexApiKeys = [
+    credential({ apiKey: "sk-codex-limited", baseUrl: codexBase, priority: 1, models: codexModels }),
+    credential({ apiKey: "sk-codex-ok", baseUrl: codexBase, models: codexModels }),
+  ];
   cfg.geminiApiKeys = [credential({ apiKey: "gemini-key", baseUrl: `http://127.0.0.1:${gemini.port}` })];
   return cfg;
 }
@@ -210,6 +246,36 @@ test("Gemini AI Studio key: Claude request is translated to generateContent and 
     expect(events[0]).toBe("message_start");
     expect(events.at(-1)).toBe("message_stop");
     expect(text).toContain("from gemini");
+  } finally {
+    await app.stop();
+  }
+});
+
+test("Codex: a mid-stream usage limit cools the account and the next request uses the other key", async () => {
+  const app = await createApp(config(), { store: new MemoryStore(), registry: new ModelRegistry(), autoRefresh: false });
+  try {
+    codexHits.length = 0;
+    // The limited key streams response.created and then a terminal usage_limit_reached error.
+    // Codex is streamed upstream even for non-stream clients, so the error arrives before any
+    // translated output: the manager fails over within the same request.
+    const res = await app.fetch(messages(codexModel, false));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { content: Array<{ type: string; text: string }> };
+    expect(body.content.map((c) => c.text).join("")).toContain("hello from codex");
+    expect(codexHits).toEqual(["sk-codex-limited", "sk-codex-ok"]);
+
+    const limited = app.manager.list().find((a) => a.attributes.api_key === "sk-codex-limited")!;
+    expect(limited.quota.reason).toBe("credential_quota");
+    expect(limited.quota.nextRecoverAt).toBeGreaterThan(Date.now() + 50 * 60 * 1000);
+
+    codexHits.length = 0;
+    const stream = await app.fetch(messages(codexModel, true));
+    const text = await stream.text();
+    const events = sseEvents(text);
+    expect(events[0]).toBe("message_start");
+    expect(events.at(-1)).toBe("message_stop");
+    expect(text).toContain("hello from codex");
+    expect(codexHits).toEqual(["sk-codex-ok"]);
   } finally {
     await app.stop();
   }

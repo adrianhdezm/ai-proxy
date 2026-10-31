@@ -8,6 +8,7 @@
 import type { Config } from "../config/types.ts";
 import type { ProviderExecutor } from "./types.ts";
 import { createClaudeExecutor } from "./claude/index.ts";
+import { createCodexExecutor } from "./codex/index.ts";
 import { createAIStudioExecutor, createGeminiCLIExecutor } from "./gemini/index.ts";
 import { createOpenAIExecutor } from "./openai/index.ts";
 
@@ -19,6 +20,7 @@ export function createExecutors(config: Config): ProviderExecutor[] {
   const proxyUrl = config.requests.proxyUrl || undefined;
   return [
     createClaudeExecutor({ proxyUrl }),
+    createCodexExecutor(),
     createGeminiCLIExecutor({ proxyUrl, switchPreviewModel: config.quotaExceeded.switchPreviewModel }),
     createAIStudioExecutor({ proxyUrl }),
     createOpenAIExecutor(config),
