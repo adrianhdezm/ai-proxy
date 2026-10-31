@@ -12,7 +12,9 @@
 //   other 4xx/5xx                          | as is  | retryAfterMs from Retry-After on 429 only
 //   stream ended without a terminal event  | 408    | requestScoped + streamTruncated (no failover, no cooldown)
 //   response.incomplete with 0 output      | 502    | requestScoped
-//   terminal event with context/invalid-signature | 400 | plain (see classifyCodexStatusError body)
+//   terminal event with context length     | 400    | requestScoped (body code context_too_large)
+//   terminal event, invalid signature      | 400    | plain (see classifyCodexStatusError body)
+//   other terminal events                  | per codexTerminalFailureStatus (error.status_code/status, type/code; else 502)
 import { StatusError } from "../types.ts";
 import { getAt, gstr, isArr, isObj } from "../../util/gpath.ts";
 import { tryParse } from "../../util/json.ts";
@@ -80,12 +82,12 @@ export interface TerminalFailure {
 }
 
 /** Go: codexTerminalFailureErrWithCooling. */
-export function codexTerminalFailureErrWithCooling(eventData: string, modelLevelCooling: boolean): TerminalFailure | undefined {
-  const streamErr = codexTerminalStreamErrWithCooling(eventData, modelLevelCooling);
+export function codexTerminalFailureErrWithCooling(eventData: string, modelLevelCooling: boolean, nowMs: number = Date.now()): TerminalFailure | undefined {
+  const streamErr = codexTerminalStreamErrWithCooling(eventData, modelLevelCooling, nowMs);
   if (streamErr) return streamErr;
   const body = codexTerminalFailureBody(eventData);
   if (body === undefined) return undefined;
-  return { error: newCodexStatusErrWithCooling(codexTerminalFailureStatus(body), body, modelLevelCooling), body };
+  return { error: newCodexStatusErrWithHeadersAndCooling(codexTerminalFailureStatus(body), undefined, body, modelLevelCooling, nowMs), body };
 }
 
 export function codexTerminalFailureErr(eventData: string): TerminalFailure | undefined {
@@ -93,10 +95,14 @@ export function codexTerminalFailureErr(eventData: string): TerminalFailure | un
 }
 
 /** Go: codexTerminalStreamErrWithCooling (the subset of terminal failures classified as 400-class request problems). */
-export function codexTerminalStreamErrWithCooling(eventData: string, modelLevelCooling: boolean): TerminalFailure | undefined {
+export function codexTerminalStreamErrWithCooling(eventData: string, modelLevelCooling: boolean, nowMs: number = Date.now()): TerminalFailure | undefined {
   const body = codexTerminalFailureBody(eventData);
   if (body === undefined || !codexTerminalStreamErrShouldHandle(body)) return undefined;
-  return { error: newCodexStatusErrWithCooling(400, body, modelLevelCooling), body };
+  const error = newCodexStatusErrWithHeadersAndCooling(400, undefined, body, modelLevelCooling, nowMs);
+  // Deviation: a context-length rejection is the request's fault on every
+  // credential, so it is marked request-scoped (no failover, no cooldown).
+  if (error.statusCode === 400 && codexTerminalErrorIsContextLength(body)) error.requestScoped = true;
+  return { error, body };
 }
 
 export function codexTerminalStreamErr(eventData: string): TerminalFailure | undefined {
