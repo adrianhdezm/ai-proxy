@@ -86,6 +86,39 @@ quota-exceeded:
   switch-preview-model: true  # fall back to a preview model
 
 # Logging. debug: true is shorthand for logging-level: debug and verbose request logs.
+# Upstream behaviour shared by OAuth and API-key credentials.
+upstream:
+  codex:
+    # Keep the client's User-Agent/Originator instead of the official Codex ones.
+    disable-codex-cloaking: false
+    # Hold back the frames sent before generation starts, so an overload or rate-limit
+    # rejection that the Codex backend sends inside an HTTP 200 stream can still fail
+    # over to another credential. Delays the response headers until the first token.
+    stream-bootstrap-buffering: false
+    # Optional ceiling for that hold-back (e.g. "20s"); "0" = frame/byte budgets only.
+    # Recommended behind reverse proxies with short read timeouts.
+    stream-bootstrap-timeout: "0"
+    # Cool only the requested model on usage_limit_reached instead of the whole account.
+    model-level-cooling: false
+  claude:
+    # Cool only the requested model on unified 5h/7d rate-limit rejections.
+    model-level-cooling: false
+    # Never disguise non-Claude-Code callers as Claude Code on OAuth credentials.
+    disable-claude-cloak-mode: false
+    # Days to keep the cloaked currentDate pin per session (0 = 1h continuity pin).
+    session-date-pin-days: 7
+    # Native tool search handling.
+    tool-search: false
+
+observability:
+  usage:
+    # In-memory usage statistics, readable at GET /v0/usage.
+    usage-statistics-enabled: false
+
+multimedia:
+  # Disable image generation everywhere, including /v1/images/generations and /v1/images/edits.
+  disable-image-generation: false
+
 debug: false
 logging-level: "info"         # debug | info | warn | error
 

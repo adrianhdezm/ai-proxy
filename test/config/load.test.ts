@@ -352,3 +352,31 @@ describe("loadConfig", () => {
     expect(cfg.claudeApiKeys).toEqual([]);
   });
 });
+
+test("upstream, observability and multimedia sections", () => {
+  const cfg = parseConfig(`
+upstream:
+  codex:
+    stream-bootstrap-buffering: true
+    stream-bootstrap-timeout: "1m20s"
+    model-level-cooling: true
+    disable-codex-cloaking: true
+  claude:
+    tool-search: true
+    disable-claude-cloak-mode: true
+    session-date-pin-days: 3
+observability:
+  usage:
+    usage-statistics-enabled: true
+multimedia:
+  disable-image-generation: true
+`);
+  expect(cfg.upstream.codex).toEqual({ disableCloaking: true, streamBootstrapBuffering: true, streamBootstrapTimeoutMs: 80_000, modelLevelCooling: true });
+  expect(cfg.upstream.claude).toEqual({ modelLevelCooling: false, disableCloakMode: true, sessionDatePinDays: 3, toolSearch: true });
+  expect(cfg.usage.statisticsEnabled).toBe(true);
+  expect(cfg.multimedia.disableImageGeneration).toBe(true);
+  const defaults = parseConfig("");
+  expect(defaults.upstream.codex.streamBootstrapBuffering).toBe(false);
+  expect(defaults.upstream.codex.streamBootstrapTimeoutMs).toBe(0);
+  expect(() => parseConfig(`upstream:\n  codex:\n    stream-bootstrap-timeout: "soon"\n`)).toThrow();
+});

@@ -97,6 +97,46 @@ export interface QuotaExceededConfig {
   switchPreviewModel: boolean;
 }
 
+/** upstream.codex: Codex executor behaviour shared by OAuth and API-key credentials. */
+export interface CodexUpstreamConfig {
+  /** Keep the client's User-Agent/Originator instead of the official Codex ones (disable-codex-cloaking). */
+  disableCloaking: boolean;
+  /**
+   * Hold back the frames that arrive before generation starts so an overload or
+   * rate-limit rejection smuggled into an HTTP 200 stream can still fail over
+   * (stream-bootstrap-buffering, default false as upstream).
+   */
+  streamBootstrapBuffering: boolean;
+  /** Upper bound in ms for that hold-back; 0 = frame/byte budgets only (stream-bootstrap-timeout). */
+  streamBootstrapTimeoutMs: number;
+  /** Scope usage_limit_reached cooldowns to the requested model (model-level-cooling). */
+  modelLevelCooling: boolean;
+}
+
+/** upstream.claude: Claude executor behaviour shared by OAuth and API-key credentials. */
+export interface ClaudeUpstreamConfig {
+  /** Scope unified 5h/7d rate-limit cooldowns to the requested model (model-level-cooling). */
+  modelLevelCooling: boolean;
+  /** Disable Claude Code request cloaking for non-Claude-Code callers (disable-claude-cloak-mode). */
+  disableCloakMode: boolean;
+  /** Days to keep the cloaked currentDate pin per session; 0 = 1h continuity pin (session-date-pin-days). */
+  sessionDatePinDays: number;
+  /** Enable native tool search handling (tool-search). */
+  toolSearch: boolean;
+}
+
+/** observability.usage */
+export interface UsageConfig {
+  /** In-memory usage aggregation (usage-statistics-enabled, default false). */
+  statisticsEnabled: boolean;
+}
+
+/** multimedia */
+export interface MultimediaConfig {
+  /** Disable image generation everywhere, including /v1/images/* (disable-image-generation). */
+  disableImageGeneration: boolean;
+}
+
 /** Per-credential model override (upstream ClaudeModel / CodexModel / GeminiModel). */
 export interface ModelOverride {
   /** Upstream model name. */
@@ -154,6 +194,9 @@ export interface Config {
   routing: RoutingConfig;
   requests: RequestsConfig;
   quotaExceeded: QuotaExceededConfig;
+  upstream: { codex: CodexUpstreamConfig; claude: ClaudeUpstreamConfig };
+  usage: UsageConfig;
+  multimedia: MultimediaConfig;
   /** Debug mode: implies loggingLevel "debug" and verbose request logging. */
   debug: boolean;
   loggingLevel: LogLevel;

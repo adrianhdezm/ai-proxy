@@ -56,6 +56,12 @@ export function defaultConfig(): Config {
     },
     requests: { proxyUrl: "", passthroughHeaders: false, requestRetry: DefaultRequestRetry },
     quotaExceeded: { switchProject: true, switchPreviewModel: true },
+    upstream: {
+      codex: { disableCloaking: false, streamBootstrapBuffering: false, streamBootstrapTimeoutMs: 0, modelLevelCooling: false },
+      claude: { modelLevelCooling: false, disableCloakMode: false, sessionDatePinDays: 7, toolSearch: false },
+    },
+    usage: { statisticsEnabled: false },
+    multimedia: { disableImageGeneration: false },
     debug: false,
     loggingLevel: "info",
     claudeApiKeys: [],
@@ -191,6 +197,24 @@ export function parseConfig(text: string, options: LoadOptions = {}): Config {
   cfg.quotaExceeded.switchProject = bool(quota["switch-project"], "quota-exceeded.switch-project", true);
   cfg.quotaExceeded.switchPreviewModel = bool(quota["switch-preview-model"], "quota-exceeded.switch-preview-model", true);
 
+  // ---- upstream / observability / multimedia ------------------------------
+  const upstream = section(root, "upstream");
+  const codex = section(upstream, "codex");
+  cfg.upstream.codex.disableCloaking = bool(codex["disable-codex-cloaking"], "upstream.codex.disable-codex-cloaking", false);
+  cfg.upstream.codex.streamBootstrapBuffering = bool(codex["stream-bootstrap-buffering"], "upstream.codex.stream-bootstrap-buffering", false);
+  cfg.upstream.codex.streamBootstrapTimeoutMs = durationMs(codex["stream-bootstrap-timeout"], "upstream.codex.stream-bootstrap-timeout", 0);
+  cfg.upstream.codex.modelLevelCooling = bool(codex["model-level-cooling"], "upstream.codex.model-level-cooling", false);
+  const claude = section(upstream, "claude");
+  cfg.upstream.claude.modelLevelCooling = bool(claude["model-level-cooling"], "upstream.claude.model-level-cooling", false);
+  cfg.upstream.claude.disableCloakMode = bool(claude["disable-claude-cloak-mode"], "upstream.claude.disable-claude-cloak-mode", false);
+  cfg.upstream.claude.sessionDatePinDays = Math.max(0, int(claude["session-date-pin-days"], "upstream.claude.session-date-pin-days", 7));
+  cfg.upstream.claude.toolSearch = bool(claude["tool-search"], "upstream.claude.tool-search", false);
+  const observability = section(root, "observability");
+  const usage = section(observability, "usage");
+  cfg.usage.statisticsEnabled = bool(first(usage["usage-statistics-enabled"], root["usage-statistics-enabled"]), "observability.usage.usage-statistics-enabled", false);
+  const multimedia = section(root, "multimedia");
+  cfg.multimedia.disableImageGeneration = bool(multimedia["disable-image-generation"], "multimedia.disable-image-generation", false);
+
   // ---- logging -------------------------------------------------------------
   cfg.debug = bool(root.debug, "debug", false);
   const level = str(root["logging-level"], "logging-level").toLowerCase();
@@ -222,6 +246,10 @@ const KnownTopLevelKeys = new Set([
   "routing",
   "requests",
   "quota-exceeded",
+  "upstream",
+  "observability",
+  "multimedia",
+  "usage-statistics-enabled",
   "debug",
   "logging-level",
   "claude-api-key",
@@ -528,6 +556,26 @@ function int(value: unknown, path: string, fallback: number): number {
   }
   if (typeof value === "string" && /^[-+]?\d+$/.test(value.trim())) return Number(value.trim());
   throw new Error(`config: ${path} must be an integer`);
+}
+
+/** Parses a Go-style duration ("20s", "1m30s", "500ms") or a bare number of seconds into milliseconds. */
+function durationMs(value: unknown, path: string, fallback: number): number {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.round(value * 1000));
+  if (typeof value !== "string") throw new Error(`config: ${path} must be a duration such as "20s"`);
+  const text = value.trim();
+  if (/^\d+(\.\d+)?$/.test(text)) return Math.round(Number(text) * 1000);
+  const units: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
+  let total = 0;
+  let rest = text;
+  const re = /^(\d+(?:\.\d+)?)(ms|s|m|h)/;
+  while (rest.length > 0) {
+    const m = re.exec(rest);
+    if (!m) throw new Error(`config: ${path} must be a duration such as "20s"`);
+    total += Number(m[1]) * units[m[2]!]!;
+    rest = rest.slice(m[0].length);
+  }
+  return Math.round(total);
 }
 
 function bool(value: unknown, path: string, fallback: boolean): boolean {

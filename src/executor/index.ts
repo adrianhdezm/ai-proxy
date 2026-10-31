@@ -19,8 +19,15 @@ export { StatusError, statusCodeOf, RequestedModelMetadataKey, RequestPathMetada
 export function createExecutors(config: Config): ProviderExecutor[] {
   const proxyUrl = config.requests.proxyUrl || undefined;
   return [
-    createClaudeExecutor({ proxyUrl }),
-    createCodexExecutor(),
+    createClaudeExecutor({
+      proxyUrl,
+      modelLevelCooling: config.upstream.claude.modelLevelCooling,
+      ...(config.upstream.claude.disableCloakMode ? { cloakMode: "never" as const } : {}),
+    }),
+    createCodexExecutor({
+      modelLevelCooling: config.upstream.codex.modelLevelCooling,
+      disableCloaking: config.upstream.codex.disableCloaking,
+    }),
     createGeminiCLIExecutor({ proxyUrl, switchPreviewModel: config.quotaExceeded.switchPreviewModel }),
     createAIStudioExecutor({ proxyUrl }),
     createOpenAIExecutor(config),
