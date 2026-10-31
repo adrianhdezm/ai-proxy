@@ -2,13 +2,18 @@
 // Claude-compatible routes. Port of the kept parts of internal/api/server_routes.go
 // and server_middleware.go (corsMiddleware, maxRequestBodyBytesMiddleware,
 // accessAuthMiddleware with internal/access/config_access).
-import type { Server } from "bun";
+//
+// GET /v1/responses with `Upgrade: websocket` is the Responses websocket
+// transport (responses_websocket.ts); it uses the same inbound API-key check as
+// the HTTP routes, at the upgrade and again for every frame.
+import type { Server, ServerWebSocket } from "bun";
 import type { Config } from "../config/types.ts";
 import { log } from "../log.ts";
 import type { ModelRegistry } from "../registry/index.ts";
 import { ClaudeCodeAPIHandler, type ExecutionManager } from "./claude_handlers.ts";
 import { OpenAIImagesHandler, openAIErrorMessage, openAIErrorResponse } from "./images_handlers.ts";
 import { OpenAIResponsesAPIHandler, isOpenAIModelsRequest } from "./responses_handlers.ts";
+import { type ResponsesWebsocketConnection, ResponsesWebsocketHandler, type ResponsesWebsocketManager, isResponsesWebsocketUpgradeRequest, websocketUpgradeHeaders } from "./responses_websocket.ts";
 import { claudeErrorMessage, claudeErrorResponse } from "./errors.ts";
 import { usageStatisticsResponse } from "../usage/http.ts";
 import type { UsageStatistics } from "../usage/statistics.ts";
@@ -34,6 +39,8 @@ export interface ServerOptions {
   now?: () => number;
   /** multimedia.disableImageGeneration: /v1/images/* answer 404. */
   disableImageGeneration?: boolean;
+  /** Ping interval for idle /v1/responses websocket turns in ms (0 = off). */
+  responsesWebsocketKeepAliveMs?: number;
 }
 
 export interface ProxyServer {
@@ -48,6 +55,8 @@ export interface ProxyServer {
   readonly handler: ClaudeCodeAPIHandler;
   /** The OpenAI Responses handler (/v1/responses, /v1/responses/compact, OpenAI /v1/models). */
   readonly responsesHandler: OpenAIResponsesAPIHandler;
+  /** The /v1/responses websocket handler (GET /v1/responses upgrades on the listening server). */
+  readonly responsesWebsocketHandler: ResponsesWebsocketHandler;
 }
 
 /** Request headers browser clients may send (Go: corsAllowedRequestHeaders). */
@@ -96,6 +105,13 @@ export function createServer(options: ServerOptions): ProxyServer {
     usage: options.usage,
     now: options.now,
   });
+  const responsesWebsocketHandler = new ResponsesWebsocketHandler({
+    manager: options.manager as ResponsesWebsocketManager,
+    registry: options.registry,
+    usage: options.usage,
+    now: options.now,
+    keepAliveIntervalMs: options.responsesWebsocketKeepAliveMs,
+  });
   const passthroughHeaders = options.passthroughHeaders ?? false;
   let server: Server<undefined> | undefined;
 
@@ -142,6 +158,10 @@ export function createServer(options: ServerOptions): ProxyServer {
     }
 
     if (responsesPath) {
+      if (path === "/v1/responses" && method === "GET") {
+        // The websocket upgrade is handled by the listening server (serveFetch); a plain GET is not one.
+        return openAIErrorResponse(openAIErrorMessage(400, { message: "websocket upgrade required for GET /v1/responses", type: "invalid_request_error" }));
+      }
       if (method !== "POST") return methodNotAllowed(["POST"]);
       const body = await readRequestBody(request, maxBodyBytes);
       if ("error" in body) {
@@ -183,6 +203,34 @@ export function createServer(options: ServerOptions): ProxyServer {
     return response;
   };
 
+  /**
+   * The listening server's fetch: GET /v1/responses websocket upgrades are
+   * authenticated like the HTTP routes and handed to the websocket handler
+   * (Go: the ResponsesWebsocket route behind the access middleware).
+   */
+  const serveFetch = async (request: Request, bunServer: Server<ResponsesWebsocketConnection>): Promise<Response | undefined> => {
+    if (!isResponsesWebsocketUpgradeRequest(request)) return fetch(request);
+    const url = new URL(request.url);
+    const authError = authenticate(request, url, apiKeys);
+    if (authError) {
+      const response = openAIErrorResponse(openAIErrorMessage(401, { message: authError, type: "authentication_error", code: "invalid_api_key" }));
+      applyCORS(response.headers, request);
+      return response;
+    }
+    const connection = responsesWebsocketHandler.connect({
+      request,
+      clientKey: authenticatedAPIKey(request, url, apiKeys),
+      authenticateTurn: () => {
+        const turnError = authenticate(request, url, apiKeys);
+        return turnError ? openAIErrorMessage(401, { message: turnError, type: "authentication_error", code: "invalid_api_key" }) : undefined;
+      },
+    });
+    if (bunServer.upgrade(request, { data: connection, headers: websocketUpgradeHeaders(request) })) return undefined;
+    const response = openAIErrorResponse(openAIErrorMessage(400, { message: "websocket upgrade failed", type: "invalid_request_error" }));
+    applyCORS(response.headers, request);
+    return response;
+  };
+
   return {
     fetch,
     get server() {
@@ -190,15 +238,41 @@ export function createServer(options: ServerOptions): ProxyServer {
     },
     handler,
     responsesHandler,
+    responsesWebsocketHandler,
     start() {
       if (server) return server;
-      server = Bun.serve({
+      const serveOptions = {
         hostname: options.host && options.host !== "" ? options.host : undefined,
         port: options.port ?? 0,
         idleTimeout: 0,
         maxRequestBodySize: maxBodyBytes > 0 ? maxBodyBytes : undefined,
-        fetch,
-      });
+        fetch: serveFetch,
+        websocket: {
+          // Deviation: no permessage-deflate (Go negotiated it by default); see responses_websocket.ts.
+          perMessageDeflate: false,
+          idleTimeout: 0,
+          open(ws: ServerWebSocket<ResponsesWebsocketConnection>) {
+            ws.data.open({
+              send(text: string) {
+                if (ws.readyState !== 1 || ws.send(text) === 0) throw new Error("websocket: client connection closed");
+              },
+              close(code?: number, reason?: string) {
+                ws.close(code, reason);
+              },
+              ping() {
+                ws.ping();
+              },
+            });
+          },
+          message(ws: ServerWebSocket<ResponsesWebsocketConnection>, message: string | Buffer) {
+            ws.data.message(message);
+          },
+          close(ws: ServerWebSocket<ResponsesWebsocketConnection>, code: number, reason: string) {
+            ws.data.close(code, reason);
+          },
+        },
+      };
+      server = Bun.serve(serveOptions as unknown as Parameters<typeof Bun.serve>[0]) as unknown as Server<undefined>;
       log.info(`listening on http://${server.hostname}:${server.port}`);
       return server;
     },

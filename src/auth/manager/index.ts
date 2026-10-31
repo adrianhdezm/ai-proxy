@@ -3,6 +3,7 @@
 export {
   AuthManager,
   CooldownWaitJitterCapMs,
+  SelectedAuthCallbackMetadataKey,
   executorKeyFromAuth,
   jitteredCooldownWait,
   type AuthManagerOptions,

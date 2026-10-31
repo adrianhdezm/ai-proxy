@@ -39,8 +39,12 @@
 // understands custom tools natively (only the dropped xAI / Kimi / Meta
 // executors normalised apply_patch).
 //
+// The Responses websocket transport lives in websockets/ (CodexWebsocketsExecutor);
+// the registered "codex" executor is websockets/auto.ts CodexAutoExecutor, which
+// picks it only for downstream websocket turns on websocket-enabled credentials.
+//
 // Not ported (outside this slice): SIWC credentials and body rules, zstd request
-// compression, websockets transport, multi-agent v2 optimisation, prompt-cache keys (Session-Id), the payload
+// compression, multi-agent v2 optimisation, prompt-cache keys (Session-Id), the payload
 // config finalizer, usage reporting and request logging, the Claude input-token
 // estimate on message_start, and the Home refresh/file-lock path.
 import type { Auth } from "../../auth/types.ts";

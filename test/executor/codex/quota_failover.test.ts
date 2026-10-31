@@ -1,10 +1,16 @@
 // Ported from: test/codex_quota_failover_test.go
-// Skipped cases: the "websocket-error" and "websocket-failed" transports of both tests (websockets not ported).
-//   Inbound requests are Claude Messages (Go used openai-response), so the "response.created" /
-//   "response.completed" payload checks become message_start / message_stop.
+// Skipped cases: none. The "sse" transport sends Claude Messages inbound (Go used openai-response), so its
+//   "response.created" / "response.completed" payload checks become message_start / message_stop; the
+//   "websocket-error" and "websocket-failed" transports run the Codex websocket executor with openai-response
+//   inbound exactly like Go.
 import { afterAll, describe, expect, test } from "bun:test";
 import { StatusError } from "../../../src/executor/types.ts";
+import { AuthManager } from "../../../src/auth/manager/index.ts";
+import { newAuth } from "../../../src/auth/types.ts";
+import { CodexWebsocketSessionStore, CodexWebsocketsExecutor } from "../../../src/executor/codex/index.ts";
+import { getGlobalRegistry } from "../../../src/registry/index.ts";
 import { accountOf, claudePayload, codexManager, drain, options, sseResponse, startUpstream } from "./helpers.ts";
+import { startFakeCodexWebsocket } from "./websocket_helpers.ts";
 
 const created = `{"type":"response.created","response":{"id":"quota-test-response"}}`;
 const quota = `{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_in_seconds":3600}`;
@@ -100,3 +106,94 @@ describe("TestCodexModelLevelCoolingPreservesSiblingModel/sse", () => {
     expect(attempts).toEqual(["quota-high", "quota-high"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Websocket transports (Go: the "websocket-error" / "websocket-failed" subtests)
+// ---------------------------------------------------------------------------
+
+function websocketQuotaHarness(transport: string, model: string, siblingModel: string, terminalFor: (account: string, request: string) => string, modelLevelCooling: boolean) {
+  const attempts: string[] = [];
+  const upstream = startFakeCodexWebsocket({
+    onMessage(conn, message) {
+      const account = (conn.headers.get("Authorization") ?? "").replace(/^Bearer /, "");
+      attempts.push(account);
+      conn.send(created);
+      conn.send(terminalFor(account, message));
+      conn.close();
+    },
+  });
+  const manager = new AuthManager({ sleep: async () => {}, random: () => 0 });
+  manager.setRetryConfig(0, 0, 0);
+  manager.registerExecutor(new CodexWebsocketsExecutor({ modelLevelCooling, store: new CodexWebsocketSessionStore() }));
+  const ids = [`quota-high-${transport}${modelLevelCooling ? "-mlc" : ""}`, `quota-low-${transport}${modelLevelCooling ? "-mlc" : ""}`];
+  ids.forEach((id, i) => {
+    getGlobalRegistry().registerClient(id, "codex", [model, siblingModel].map((m) => ({ id: m, type: "codex" })));
+    manager.register(newAuth({ id, provider: "codex", attributes: { priority: String(4 - i), base_url: upstream.url, api_key: i === 0 ? "quota-high" : "quota-low" }, metadata: { disable_cooling: false } }));
+  });
+  const run = async (requestModel: string) => {
+    const result = await manager.executeStream(["codex"], { model: requestModel, payload: JSON.stringify({ model: requestModel, input: "hello" }), format: "openai-response" }, options("openai-response", true));
+    const { chunks, error } = await drain(result);
+    return { payload: chunks.join(""), error };
+  };
+  return {
+    attempts,
+    manager,
+    highID: ids[0]!,
+    run,
+    cleanup() {
+      for (const id of ids) getGlobalRegistry().unregisterClient(id);
+      upstream.close();
+    },
+  };
+}
+
+function quotaTerminal(transport: string): string {
+  return transport === "websocket-failed" ? `{"type":"response.failed","response":{"error":${quota}}}` : `{"type":"error","status":429,"error":${quota}}`;
+}
+
+for (const transport of ["websocket-error", "websocket-failed"]) {
+  describe(`TestCodexTerminalQuotaCoolsAccountAcrossModels/${transport}`, () => {
+    const model = "gpt-5.4";
+    const siblingModel = "gpt-5.4-mini";
+    const harness = websocketQuotaHarness(transport, model, siblingModel, (account) => (account === "quota-high" ? quotaTerminal(transport) : completed), false);
+    afterAll(() => harness.cleanup());
+
+    test("a terminal usage limit cools the whole account and the sibling model fails over", async () => {
+      const before = Date.now();
+      const first = await harness.run(model);
+      expect(first.payload).toContain("response.created");
+      expect(first.error).toBeInstanceOf(StatusError);
+      expect((first.error as StatusError).credentialScoped).toBe(true);
+      const high = harness.manager.getById(harness.highID)!;
+      expect(high.quota.reason).toBe("credential_quota");
+      expect(high.quota.nextRecoverAt).toBeGreaterThanOrEqual(before + Hour);
+      const sibling = await harness.run(siblingModel);
+      expect(sibling.error).toBeUndefined();
+      expect(sibling.payload).toContain("response.completed");
+      expect(harness.attempts).toEqual(["quota-high", "quota-low"]);
+    });
+  });
+
+  describe(`TestCodexModelLevelCoolingPreservesSiblingModel/${transport}`, () => {
+    const model = "gpt-5.3-codex-spark";
+    const siblingModel = "gpt-5.6-sol";
+    const harness = websocketQuotaHarness(transport, model, siblingModel, (account, request) => (account === "quota-high" && request.includes(model) ? quotaTerminal(transport) : completed), true);
+    afterAll(() => harness.cleanup());
+
+    test("only the model cools and the sibling stays on the same account", async () => {
+      const before = Date.now();
+      const first = await harness.run(model);
+      expect(first.payload).toContain("response.created");
+      expect(first.error).toBeInstanceOf(StatusError);
+      expect((first.error as StatusError).credentialScoped).toBe(false);
+      const high = harness.manager.getById(harness.highID)!;
+      expect(high.quota.reason).not.toBe("credential_quota");
+      expect(high.quota.reason).toBe("quota");
+      expect(high.quota.nextRecoverAt).toBeGreaterThanOrEqual(before + Hour);
+      const sibling = await harness.run(siblingModel);
+      expect(sibling.error).toBeUndefined();
+      expect(sibling.payload).toContain("response.completed");
+      expect(harness.attempts).toEqual(["quota-high", "quota-high"]);
+    });
+  });
+}

@@ -10,7 +10,7 @@ import type { ProviderExecutor } from "./types.ts";
 import { createClaudeExecutor } from "./claude/index.ts";
 import type { ClaudeWebSearchResultCacheConfig } from "./claude/web_search_results.ts";
 import { setClientToolSearchEnabled } from "../translator/claude/openai/responses/index.ts";
-import { createCodexExecutor } from "./codex/index.ts";
+import { createCodexAutoExecutor } from "./codex/index.ts";
 import { createAIStudioExecutor, createGeminiCLIExecutor } from "./gemini/index.ts";
 import { createOpenAIExecutor } from "./openai/index.ts";
 
@@ -57,7 +57,9 @@ export function createExecutors(config: Config): ProviderExecutor[] {
       sessionDatePinDays: config.upstream.claude.sessionDatePinDays,
       ...(config.upstream.claude.disableCloakMode ? { cloakMode: "never" as const } : {}),
     }),
-    createCodexExecutor({
+    // Go: NewCodexAutoExecutor — HTTP/SSE, or the Responses websocket for downstream
+    // websocket turns on credentials that enable websockets.
+    createCodexAutoExecutor({
       modelLevelCooling: config.upstream.codex.modelLevelCooling,
       disableCloaking: config.upstream.codex.disableCloaking,
       streamBootstrapBuffering: config.upstream.codex.streamBootstrapBuffering,

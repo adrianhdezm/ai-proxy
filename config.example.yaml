@@ -100,6 +100,11 @@ upstream:
     stream-bootstrap-timeout: "0"
     # Cool only the requested model on usage_limit_reached instead of the whole account.
     model-level-cooling: false
+    # Websockets: Codex clients may open a websocket on GET /v1/responses (same API keys).
+    # Such turns reach the Codex backend over its Responses websocket
+    # (wss://.../backend-api/codex/responses, one socket per client connection) only on
+    # credentials whose auth file sets "websockets": true; every other request uses HTTP/SSE.
+    # Response steering and websocket compression settings are not supported.
   claude:
     # Cool only the requested model on unified 5h/7d rate-limit rejections.
     model-level-cooling: false

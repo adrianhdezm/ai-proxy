@@ -13,3 +13,4 @@ export * from "./tokens.ts";
 export * from "./tool_schema.ts";
 export * from "./bootstrap.ts";
 export * from "./reasoning_replay.ts";
+export * from "./websockets/index.ts";

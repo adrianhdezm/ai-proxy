@@ -7,7 +7,7 @@
 //
 // Dropped from upstream: Home mode, plugin schedulers, session affinity,
 // weighted selection, OAuth/API-key model alias pools, request interceptors,
-// RequestAuthPreparer, antigravity credits fallback, websocket executors, SIWC,
+// RequestAuthPreparer, antigravity credits fallback, Home execution-session auths, SIWC,
 // Devin quota revalidation, cooldown state stores and registration epochs.
 import {
   PinnedAuthMetadataKey,
@@ -216,6 +216,31 @@ function authSelectionModelFromOptions(opts: ExecOptions, fallback: string): str
   return requested !== "" ? requested : (fallback ?? "").trim();
 }
 
+/**
+ * ExecOptions.metadata key of an optional `(authId: string) => void` callback
+ * invoked every time a credential is selected for an attempt (Go:
+ * handlers.WithSelectedAuthIDCallback). Used by the downstream websocket handler.
+ */
+export const SelectedAuthCallbackMetadataKey = "cliproxy.selected_auth_callback";
+
+/** Records the selected credential and notifies the selection callback, if any. */
+function notifySelectedAuth(opts: ExecOptions, authId: string): void {
+  opts.metadata![SelectedAuthMetadataKey] = authId;
+  const callback = opts.metadata![SelectedAuthCallbackMetadataKey];
+  if (typeof callback !== "function") return;
+  try {
+    (callback as (id: string) => void)(authId);
+  } catch (err) {
+    log.debug("selected auth callback failed:", err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Executor capabilities for execution sessions (Go: ExecutionSessionCloser / AuthExecutionSessionCloser). */
+interface ExecutionSessionCloser {
+  closeExecutionSession?(sessionId: string): void;
+  closeAuthExecutionSessions?(authId: string): void;
+}
+
 function preferredExecutionAttemptError(fallback: unknown, upstream: unknown): unknown {
   if (isAbortError(fallback)) return fallback;
   if (upstream === undefined) return fallback;
@@ -418,11 +443,22 @@ export class AuthManager {
   remove(id: string): void {
     const key = (id ?? "").trim();
     if (key === "" || !this.auths.has(key)) return;
+    const removed = this.auths.get(key)!;
     this.auths.delete(key);
     this.generations.delete(key);
     this.authCooldownSeq.delete(key);
     this.modelCooldownSeq.delete(key);
     this.refreshLoop?.remove(key);
+    // Go: Remove closes the removed credential's execution sessions (upstream websockets).
+    const closer = this.executor(executorKeyFromAuth(removed)) as (ProviderExecutor & ExecutionSessionCloser) | undefined;
+    closer?.closeAuthExecutionSessions?.(key);
+  }
+
+  /** Asks every executor to release an execution session (Go: CloseExecutionSession, Home parts dropped). */
+  closeExecutionSession(sessionId: string): void {
+    const id = (sessionId ?? "").trim();
+    if (id === "") return;
+    for (const executor of this.executors.values()) (executor as ProviderExecutor & ExecutionSessionCloser).closeExecutionSession?.(id);
   }
 
   list(): Auth[] {
@@ -816,7 +852,7 @@ export class AuthManager {
       }
       let { auth } = picked;
       const { executor, provider } = picked;
-      opts.metadata![SelectedAuthMetadataKey] = auth.id;
+      notifySelectedAuth(opts, auth.id);
       tried.add(auth.id);
       round.attempted.add(auth.id);
       const resultModel = canonicalModelKey(routeModel);
@@ -834,7 +870,7 @@ export class AuthManager {
         const refreshed = await this.tryRefreshAfterUnauthorized(auth, errExec, false);
         if (refreshed) {
           auth = refreshed;
-          opts.metadata![SelectedAuthMetadataKey] = auth.id;
+          notifySelectedAuth(opts, auth.id);
           executionSeq = this.nextExecutionSeq();
           errExec = undefined;
           try {
@@ -890,7 +926,7 @@ export class AuthManager {
       }
       let { auth } = picked;
       const { executor, provider } = picked;
-      opts.metadata![SelectedAuthMetadataKey] = auth.id;
+      notifySelectedAuth(opts, auth.id);
       tried.add(auth.id);
       round.attempted.add(auth.id);
       const resultModel = canonicalModelKey(routeModel);
@@ -909,7 +945,7 @@ export class AuthManager {
         const refreshed = await this.tryRefreshAfterUnauthorized(auth, cause, false);
         if (refreshed) {
           auth = refreshed;
-          opts.metadata![SelectedAuthMetadataKey] = auth.id;
+          notifySelectedAuth(opts, auth.id);
           executionSeq = this.nextExecutionSeq();
           errStream = undefined;
           try {
