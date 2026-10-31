@@ -427,7 +427,8 @@ export function parseRetryAfterHeader(headers: Headers | undefined, nowMs: numbe
 /**
  * Whether a terminal failure inside an HTTP 200 stream is a transient capacity
  * rejection another credential may serve (Go: isCodexOverloadBootstrapFailure).
- * Only informational here: the bootstrap-buffering path that acts on it is not ported.
+ * Only these fail a buffered bootstrap over (see bootstrap.ts); every other
+ * terminal failure keeps its in-stream delivery.
  */
 export function isCodexOverloadBootstrapFailure(body: string): boolean {
   if (isCodexTransientCapacityError(body)) return true;

@@ -16,8 +16,11 @@
 // its bytes. Non-data lines inside a held event are delivered as soon as they are
 // read, i.e. before the event's data.
 //
-// Dropped from upstream: the bootstrap budget checker and RawLines/RawBytes
-// accounting (bootstrap buffering is not ported).
+// Bootstrap buffering reads the stream one physical line at a time through
+// splitLines / scanLineItems / endLines / finishItems, so the budget checker
+// (Go: SetBudgetChecker) always sees the caller's state for every earlier line,
+// and each delivered item carries the physical lines and bytes it consumed
+// (Go: RawLines / RawBytes). push / flush remain for callers that only need lines.
 
 export const codexSSEDataPrefix = "data:";
 const codexSSEDiagnosticLines = 8;
@@ -34,8 +37,22 @@ export interface CodexSSEDiagnostic {
   jsonErrorOffset: number;
 }
 
-function utf8Len(s: string): number {
-  return new TextEncoder().encode(s).length;
+/** UTF-8 byte length of a string without allocating (Go: len([]byte)). */
+export function utf8Len(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const next = s.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        n += 4;
+        i++;
+      } else n += 3;
+    } else n += 3;
+  }
+  return n;
 }
 
 function jsonValid(text: string): boolean {
@@ -118,6 +135,23 @@ class CodexJSONNesting {
   }
 }
 
+/**
+ * One delivered line and what it cost upstream (Go: Bytes / RawLines / RawBytes).
+ * `budget` marks the empty item delivered when the budget checker fired while
+ * an event was being held; the held event itself is kept and delivered later.
+ */
+export interface CodexSSEItem {
+  line: string;
+  /** Physical upstream lines consumed to produce this item (at least 1). */
+  rawLines: number;
+  /** Bytes of those physical lines (the line's own length when that is 0). */
+  rawBytes: number;
+  budget?: true;
+}
+
+/** Go: the SetBudgetChecker callback; returning true releases the caller's hold. */
+export type CodexSSEBudgetChecker = (line: string, heldLines: number, heldBytes: number) => boolean;
+
 export interface CodexSSEScannerOptions {
   /** Bounds the data lines collected for one event (Go: maxBytes). Default 50 MiB. */
   maxBytes?: number;
@@ -138,6 +172,7 @@ export class CodexSSEScanner {
   private joined = "";
   private nesting = new CodexJSONNesting();
   private warned = false;
+  private budgetCheck?: CodexSSEBudgetChecker;
 
   constructor(options: CodexSSEScannerOptions = {}) {
     this.maxBytes = options.maxBytes ?? 52_428_800;
@@ -154,57 +189,98 @@ export class CodexSSEScanner {
     return this.held.length;
   }
 
+  /** Bytes of the data lines currently held in an incomplete event (Go: HeldBytes). */
+  heldBytes(): number {
+    return this.size;
+  }
+
+  /**
+   * Sets the callback consulted on each data line held in an incomplete event
+   * that does not complete it. When it returns true the scanner delivers one
+   * budget item and forgets the checker; the held event is kept (Go: SetBudgetChecker).
+   */
+  setBudgetChecker(fn: CodexSSEBudgetChecker | undefined): void {
+    this.budgetCheck = fn;
+  }
+
   /** Feeds a chunk and returns the lines delivered so far, in order. */
   push(chunk: string | Uint8Array): string[] {
-    const text = typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
     const out: string[] = [];
-    let buffer = this.partial + text;
-    for (;;) {
-      const idx = buffer.indexOf("\n");
-      if (idx < 0) break;
-      let line = buffer.slice(0, idx);
-      if (line.endsWith("\r")) line = line.slice(0, -1);
-      buffer = buffer.slice(idx + 1);
-      this.scanLine(line, out);
-    }
-    this.partial = buffer;
+    for (const line of this.splitLines(chunk)) for (const item of this.scanLineItems(line)) if (!item.budget) out.push(item.line);
     return out;
   }
 
   /** Delivers the unterminated last line and any held event at end of stream. */
   flush(): string[] {
     const out: string[] = [];
+    for (const line of this.endLines()) for (const item of this.scanLineItems(line)) if (!item.budget) out.push(item.line);
+    for (const item of this.finishItems()) out.push(item.line);
+    return out;
+  }
+
+  /** Splits a chunk into the complete physical lines it finishes (bufio.ScanLines: "\n", trailing "\r" dropped). */
+  splitLines(chunk: string | Uint8Array): string[] {
+    const text = typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
+    const lines: string[] = [];
+    let buffer = this.partial + text;
+    let start = 0;
+    for (;;) {
+      const idx = buffer.indexOf("\n", start);
+      if (idx < 0) break;
+      let line = buffer.slice(start, idx);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      lines.push(line);
+      start = idx + 1;
+    }
+    this.partial = start === 0 ? buffer : buffer.slice(start);
+    buffer = "";
+    return lines;
+  }
+
+  /** The unterminated last physical line at end of stream, if any. */
+  endLines(): string[] {
     const tail = this.partial + this.decoder.decode();
     this.partial = "";
-    if (tail !== "") {
-      let line = tail;
-      if (line.endsWith("\r")) line = line.slice(0, -1);
-      this.scanLine(line, out);
-    }
+    if (tail === "") return [];
+    return [tail.endsWith("\r") ? tail.slice(0, -1) : tail];
+  }
+
+  /** Releases an event still held at end of stream (Go: the held release after the last Scan). */
+  finishItems(): CodexSSEItem[] {
+    const out: CodexSSEItem[] = [];
     if (this.held.length > 0) this.release(out);
     return out;
   }
 
-  private scanLine(line: string, out: string[]): void {
+  /** Scans one physical line and returns the items it delivers, in order (Go: one Scan step). */
+  scanLineItems(line: string): CodexSSEItem[] {
+    const out: CodexSSEItem[] = [];
     if (!line.startsWith(codexSSEDataPrefix)) {
       if (line === "" && this.held.length > 0) {
         this.release(out, "");
-        return;
+        return out;
       }
-      out.push(line);
-      return;
+      out.push(rawItem(line));
+      return out;
     }
     if (this.held.length === 0) {
       if (this.stock || !codexSSEIncompleteJSON(codexSSEValue(line).trim())) {
-        out.push(line);
-        return;
+        out.push(rawItem(line));
+        return out;
       }
     } else if (this.size + utf8Len(line) > this.maxBytes) {
       // Bounded like a single line: stop collecting and let this line be read on its own.
       this.release(out, line);
-      return;
+      return out;
     }
-    if (this.hold(line)) this.release(out);
+    const closed = this.hold(line);
+    if (!closed && this.budgetCheck && this.budgetCheck(line, this.held.length, this.size)) {
+      this.budgetCheck = undefined;
+      out.push({ line: "", rawLines: 1, rawBytes: 0, budget: true });
+      return out;
+    }
+    if (closed) this.release(out);
+    return out;
   }
 
   /** Adds a data line to the held event and reports whether its data has closed (Go: hold). */
@@ -221,9 +297,10 @@ export class CodexSSEScanner {
   }
 
   /** Ends the collection and delivers the event as one line, followed by the line that ended it (Go: release). */
-  private release(out: string[], ...end: string[]): void {
-    out.push(this.assemble(this.held, this.joined));
-    for (const e of end) out.push(e);
+  private release(out: CodexSSEItem[], ...end: string[]): void {
+    const line = this.assemble(this.held, this.joined);
+    out.push({ line, rawLines: this.held.length || 1, rawBytes: this.size || utf8Len(line) });
+    for (const e of end) out.push(rawItem(e));
     this.held = [];
     this.size = 0;
     this.joined = "";
@@ -262,6 +339,10 @@ export class CodexSSEScanner {
     };
     if (this.onDiagnostic) this.onDiagnostic(diag);
   }
+}
+
+function rawItem(line: string): CodexSSEItem {
+  return { line, rawLines: 1, rawBytes: utf8Len(line) };
 }
 
 /** Best-effort parse error position from the runtime's message; -1 when unavailable. */

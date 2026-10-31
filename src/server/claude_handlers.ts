@@ -7,6 +7,7 @@
 // Dropped from upstream: model routers / plugin executors, request interceptors,
 // pre-first-token keep-alive ticks, gzip sniffing of non-stream bodies (Bun's
 // fetch already decompresses), the "auto" model alias and the API_RESPONSE log hooks.
+import type { Auth } from "../auth/types.ts";
 import { RequestPathMetadataKey, RequestedModelMetadataKey, type ErrorMessage, type ExecOptions, type ExecRequest, type ExecResponse, type StreamResult } from "../executor/types.ts";
 import { getGlobalRegistry, type ModelRegistry } from "../registry/index.ts";
 import { parseSuffix } from "../thinking/suffix.ts";
@@ -16,12 +17,22 @@ import { claudeErrorBody, claudeErrorMessage, claudeErrorResponse, enrichAuthSel
 import { filterUpstreamHeaders, forwardableInboundHeaders, writeUpstreamHeaders } from "./headers.ts";
 import { buildClaudeModelsResponse, resolveClaudeModelIDPrefix } from "./models.ts";
 import { ClaudeSSEStreamState } from "./sse_state.ts";
+import { RequestUsageRecorder, claudeSessionID } from "../usage/recorder.ts";
+import type { UsageStatistics } from "../usage/statistics.ts";
 
 /** The slice of AuthManager the handlers need (structurally satisfied by AuthManager). */
 export interface ExecutionManager {
   execute(providers: string[], req: ExecRequest, opts: ExecOptions): Promise<ExecResponse>;
   executeStream(providers: string[], req: ExecRequest, opts: ExecOptions): Promise<StreamResult>;
   executeCount(providers: string[], req: ExecRequest, opts: ExecOptions): Promise<ExecResponse>;
+  /** Credential lookup used to attribute usage records (AuthManager.getById). */
+  getById?(id: string): Auth | undefined;
+}
+
+/** Per-request context the server hands to the handler. */
+export interface ClaudeRequestContext {
+  /** The inbound API key the request authenticated with ("" when access is open). */
+  clientKey?: string;
 }
 
 export interface ClaudeHandlerOptions {
@@ -36,6 +47,10 @@ export interface ClaudeHandlerOptions {
    * carrying such ids are always decoded.
    */
   cloakModelList?: boolean;
+  /** Usage statistics store; one record per /v1/messages request when enabled. */
+  usage?: UsageStatistics;
+  /** Clock (epoch ms) for usage timestamps and latency. */
+  now?: () => number;
 }
 
 const sseErrorPrefix = "event: error\ndata: ";
@@ -45,12 +60,16 @@ export class ClaudeCodeAPIHandler {
   private readonly registry: ModelRegistry;
   private readonly passthroughHeaders: boolean;
   private readonly cloakModelList: boolean;
+  private readonly usage: UsageStatistics | undefined;
+  private readonly now: () => number;
 
   constructor(options: ClaudeHandlerOptions) {
     this.manager = options.manager;
     this.registry = options.registry ?? getGlobalRegistry();
     this.passthroughHeaders = options.passthroughHeaders ?? false;
     this.cloakModelList = options.cloakModelList ?? false;
+    this.usage = options.usage;
+    this.now = options.now ?? Date.now;
   }
 
   /** Handler type (Go: HandlerType). */
@@ -80,13 +99,15 @@ export class ClaudeCodeAPIHandler {
   }
 
   /** POST /v1/messages (Go: ClaudeMessages). */
-  async claudeMessages(request: Request, rawJSON: string): Promise<Response> {
+  async claudeMessages(request: Request, rawJSON: string, context: ClaudeRequestContext = {}): Promise<Response> {
+    const usage: UsageContext = { start: this.now(), clientKey: context.clientKey ?? "", alias: "" };
     const parsed = parseRequestBody(rawJSON);
     if ("error" in parsed) return this.errorResponse(parsed.error);
+    usage.alias = typeof parsed.object.model === "string" ? parsed.object.model : "";
     const body = rewriteClaudeDDModelInBody(parsed.object, parsed.raw);
     const stream = body.object.stream === true;
-    if (!stream) return this.handleNonStreamingResponse(request, body);
-    return this.handleStreamingResponse(request, body);
+    if (!stream) return this.handleNonStreamingResponse(request, body, usage);
+    return this.handleStreamingResponse(request, body, usage);
   }
 
   /** POST /v1/messages/count_tokens (Go: ClaudeCountTokens). */
@@ -153,15 +174,39 @@ export class ClaudeCodeAPIHandler {
     return { providers: details.providers, req, opts };
   }
 
-  private async handleNonStreamingResponse(request: Request, body: ParsedBody): Promise<Response> {
+  /** A usage recorder for an executed request, or undefined when statistics are off. */
+  private usageRecorder(request: Request, body: ParsedBody, prepared: { providers: string[]; req: ExecRequest; opts: ExecOptions }, usage: UsageContext | undefined): RequestUsageRecorder | undefined {
+    if (!usage || !this.usage?.enabled) return undefined;
+    const manager = this.manager;
+    return new RequestUsageRecorder({
+      statistics: this.usage,
+      now: this.now,
+      start: usage.start,
+      endpoint: `${request.method.toUpperCase()} ${new URL(request.url).pathname}`,
+      model: prepared.req.model,
+      alias: usage.alias,
+      clientKey: usage.clientKey,
+      sessionId: claudeSessionID(request.headers, body.object),
+      stream: prepared.opts.stream,
+      metadata: prepared.opts.metadata,
+      providers: prepared.providers,
+      lookupAuth: manager.getById ? (id) => manager.getById!(id) : undefined,
+    });
+  }
+
+  private async handleNonStreamingResponse(request: Request, body: ParsedBody, usage?: UsageContext): Promise<Response> {
     const prepared = this.prepareExecution(request, body, false);
     if ("error" in prepared) return this.errorResponse(prepared.error);
+    const recorder = this.usageRecorder(request, body, prepared, usage);
     let resp: ExecResponse;
     try {
       resp = await this.manager.execute(prepared.providers, prepared.req, prepared.opts);
     } catch (err) {
-      return this.errorResponse(executionErrorMessage(enrichAuthSelectionError(err, prepared.providers, prepared.req.model)));
+      const msg = executionErrorMessage(enrichAuthSelectionError(err, prepared.providers, prepared.req.model));
+      recorder?.recordFailure(msg.statusCode);
+      return this.errorResponse(msg);
     }
+    recorder?.recordResponse(resp.payload);
     return this.jsonSuccess(resp);
   }
 
@@ -172,28 +217,49 @@ export class ClaudeCodeAPIHandler {
    * `event: error` frame and a close without message_stop becomes a 502 frame
    * (Go: handleStreamingResponse + forwardClaudeStreamWithState).
    */
-  private async handleStreamingResponse(request: Request, body: ParsedBody): Promise<Response> {
+  private async handleStreamingResponse(request: Request, body: ParsedBody, usage?: UsageContext): Promise<Response> {
     const prepared = this.prepareExecution(request, body, true);
     if ("error" in prepared) return this.errorResponse(prepared.error);
     const { providers, req, opts } = prepared;
+    const recorder = this.usageRecorder(request, body, prepared, usage);
     let result: StreamResult;
     try {
       result = await this.manager.executeStream(providers, req, opts);
     } catch (err) {
-      return this.errorResponse(executionErrorMessage(enrichAuthSelectionError(err, providers, req.model)));
+      const msg = executionErrorMessage(enrichAuthSelectionError(err, providers, req.model));
+      recorder?.recordFailure(msg.statusCode);
+      return this.errorResponse(msg);
     }
-    const iterator = result.chunks[Symbol.asyncIterator]();
+    let iterator = result.chunks[Symbol.asyncIterator]();
     let first: IteratorResult<string>;
     try {
       first = await nextNonEmpty(iterator);
     } catch (err) {
       // Upstream failed before any payload: plain JSON error, no SSE commit.
-      return this.errorResponse(executionErrorMessage(enrichAuthSelectionError(err, providers, req.model)));
+      const msg = executionErrorMessage(enrichAuthSelectionError(err, providers, req.model));
+      recorder?.recordFailure(msg.statusCode);
+      return this.errorResponse(msg);
+    }
+
+    // Usage: observe the forwarded chunks and record once the consumer is done.
+    let onDone: ((err: ErrorMessage | undefined) => void) | undefined;
+    if (recorder) {
+      const { observer, delivery } = recorder.startStream(request.signal);
+      const observe = (chunk: string) => {
+        try {
+          observer.observeChunk(chunk);
+        } catch {
+          // usage observation never breaks forwarding
+        }
+      };
+      if (!first.done && typeof first.value === "string") observe(first.value);
+      iterator = observeIterator(iterator, observe);
+      onDone = (err) => delivery.finish(err);
     }
 
     const headers = new Headers({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
     if (this.passthroughHeaders) writeUpstreamHeaders(headers, filterUpstreamHeaders(result.headers));
-    const stream = forwardClaudeStream({ first, iterator, signal: request.signal, errorBody: (msg) => claudeErrorBody(msg) });
+    const stream = forwardClaudeStream({ first, iterator, signal: request.signal, errorBody: (msg) => claudeErrorBody(msg), onDone });
     return new Response(stream, { status: 200, headers });
   }
 }
@@ -201,6 +267,27 @@ export class ClaudeCodeAPIHandler {
 interface ParsedBody {
   raw: string;
   object: JSONObject;
+}
+
+/** Usage bookkeeping captured when the request arrives. */
+interface UsageContext {
+  start: number;
+  clientKey: string;
+  /** Model string as the client sent it (before decoding cloaked ids). */
+  alias: string;
+}
+
+/** Wraps an iterator so every yielded chunk is observed before it is forwarded. */
+function observeIterator(iterator: AsyncIterator<string>, observe: (chunk: string) => void): AsyncIterator<string> {
+  const wrapped: AsyncIterator<string> = {
+    async next() {
+      const next = await iterator.next();
+      if (!next.done && typeof next.value === "string" && next.value.length > 0) observe(next.value);
+      return next;
+    },
+  };
+  if (iterator.return) wrapped.return = (value?: unknown) => iterator.return!(value);
+  return wrapped;
 }
 
 function parseRequestBody(rawJSON: string): ParsedBody | { error: ErrorMessage } {
