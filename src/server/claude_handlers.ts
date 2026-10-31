@@ -14,6 +14,7 @@ import { parseSuffix } from "../thinking/suffix.ts";
 import { FormatClaude } from "../translator/types.ts";
 import { tryParse, isObject, type JSONObject } from "../util/json.ts";
 import { claudeErrorBody, claudeErrorMessage, claudeErrorResponse, enrichAuthSelectionError, executionErrorMessage } from "./errors.ts";
+import { getRequestDetails, type RequestDetails } from "./routing.ts";
 import { filterUpstreamHeaders, forwardableInboundHeaders, writeUpstreamHeaders } from "./headers.ts";
 import { buildClaudeModelsResponse, resolveClaudeModelIDPrefix } from "./models.ts";
 import { ClaudeSSEStreamState } from "./sse_state.ts";
@@ -144,17 +145,10 @@ export class ClaudeCodeAPIHandler {
    * thinking suffix is stripped for the lookup, the full model name travels
    * to the executor (Go: getRequestDetails).
    */
-  getRequestDetails(modelName: string): { providers: string[]; model: string } | { error: ErrorMessage } {
-    const parsedSuffix = parseSuffix(modelName);
-    const baseModel = parsedSuffix.modelName.trim();
-    let providers = baseModel === "" ? [] : this.registry.getModelProviders(baseModel);
-    if (providers.length === 0 && baseModel !== modelName) providers = this.registry.getModelProviders(modelName);
-    if (providers.length === 0) {
-      const name = modelName.trim();
-      return { error: claudeErrorMessage(404, "not_found_error", name === "" ? "model not found" : `model not found: ${name}`) };
-    }
-    return { providers, model: modelName };
+  getRequestDetails(modelName: string): RequestDetails {
+    return getRequestDetails(this.registry, modelName);
   }
+
 
   private prepareExecution(request: Request, body: ParsedBody, stream: boolean, clientKey?: string): { providers: string[]; req: ExecRequest; opts: ExecOptions } | { error: ErrorMessage } {
     const modelName = typeof body.object.model === "string" ? body.object.model : "";

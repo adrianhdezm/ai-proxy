@@ -33,6 +33,7 @@ import { RequestUsageRecorder } from "../usage/recorder.ts";
 import type { UsageStatistics } from "../usage/statistics.ts";
 import type { ExecutionManager } from "./claude_handlers.ts";
 import { claudeErrorText, enrichAuthSelectionError, executionErrorMessage, httpStatusText } from "./errors.ts";
+import { readBoundedRequestBody } from "./request_body.ts";
 import { filterUpstreamHeaders, forwardableInboundHeaders, isCPAReservedResponseHeader, writeUpstreamHeaders } from "./headers.ts";
 
 export const gptImage15Model = "gpt-image-1.5";
@@ -312,25 +313,17 @@ export class OpenAIImagesHandler {
     return this.registryProviders(model).filter((provider) => allowed.has(provider));
   }
 
-  private async readBody(request: Request): Promise<{ bytes: Uint8Array } | { error: ErrorMessage }> {
-    const tooLarge = () => ({ error: openAIErrorMessage(413, { message: "request body too large", type: "invalid_request_error", code: "request_too_large" }) });
-    if (this.maxBodyBytes > 0) {
-      const declared = Number(request.headers.get("Content-Length") ?? "");
-      if (Number.isFinite(declared) && declared > this.maxBodyBytes) return tooLarge();
-    }
-    let buffer: ArrayBuffer;
-    try {
-      buffer = await request.arrayBuffer();
-    } catch (err) {
-      return { error: invalidRequest(`Invalid request: ${err instanceof Error ? err.message : String(err)}`) };
-    }
-    if (this.maxBodyBytes > 0 && buffer.byteLength > this.maxBodyBytes) return tooLarge();
-    return { bytes: new Uint8Array(buffer) };
+  private async readBody(request: Request, decodeContentEncoding = false): Promise<{ bytes: Uint8Array } | { error: ErrorMessage }> {
+    const result = await readBoundedRequestBody(request, this.maxBodyBytes, { decodeContentEncoding });
+    if ("tooLarge" in result) return { error: openAIErrorMessage(413, { message: "request body too large", type: "invalid_request_error", code: "request_too_large" }) };
+    if ("error" in result) return { error: invalidRequest(`Invalid request: ${result.error}`) };
+    return { bytes: result.bytes };
   }
+
 
   /** Reads and validates a JSON image request (model default, support check, prompt). */
   private async readJSONCall(request: Request, path: string): Promise<ImageCall | { error: ErrorMessage }> {
-    const body = await this.readBody(request);
+    const body = await this.readBody(request, true);
     if ("error" in body) return body;
     const parsed = tryParse(new TextDecoder().decode(body.bytes));
     if (!isObject(parsed)) return { error: invalidRequest("Invalid request: body must be valid JSON") };

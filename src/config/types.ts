@@ -4,6 +4,7 @@
 // v8/legacy dual-layout migration of upstream is intentionally not reproduced.
 import type { ThinkingSupport } from "../registry/types.ts";
 import type { LogLevel } from "../log.ts";
+import type { ClaudeHeaderDefaults } from "../executor/claude/device_profile.ts";
 
 export interface ServerConfig {
   /** Interface to bind; "" binds all interfaces. */
@@ -12,6 +13,8 @@ export interface ServerConfig {
   port: number;
   /** Maximum inbound request body size in bytes; 0 disables the limit. */
   maxRequestBodyBytes: number;
+  /** Negotiated downstream response compression (server.response-compression: enabled, min-bytes). */
+  responseCompression?: { enabled: boolean; minBytes: number };
 }
 
 export interface AccessConfig {
@@ -50,7 +53,12 @@ export interface AuthConfig {
   vault: VaultConfig;
 }
 
-export type RoutingStrategy = "round-robin" | "fill-first";
+/**
+ * Credential selection strategy (upstream routing.strategy). "weighted-round-robin" is
+ * accepted for config compatibility; the manager has no weighted selector yet, so it
+ * runs as round-robin.
+ */
+export type RoutingStrategy = "round-robin" | "fill-first" | "weighted-round-robin";
 
 export interface RetryConfig {
   /**
@@ -123,6 +131,8 @@ export interface ClaudeUpstreamConfig {
   sessionDatePinDays: number;
   /** Enable native tool search handling (tool-search). */
   toolSearch: boolean;
+  /** Operator overrides for the emitted Claude Code headers (header-defaults / legacy claude-header-defaults). */
+  headerDefaults?: ClaudeHeaderDefaults;
 }
 
 /** client.codex.web-search-result-cache */
@@ -163,6 +173,36 @@ export interface ModelOverride {
   forceMapping: boolean;
   /** Optional thinking capability override. */
   thinking?: ThinkingSupport;
+  /** Codex keys: the upstream accepts configuration_update input items (support-configuration-update). */
+  supportConfigurationUpdate?: boolean;
+  /** OpenAI keys: send max_completion_tokens instead of max_tokens (use-max-completion-tokens). */
+  useMaxCompletionTokens?: boolean;
+  /** Accepted input modalities, lower-cased and de-duplicated (input-modalities). */
+  inputModalities?: string[];
+}
+
+/** One OAuth model alias (upstream config.OAuthModelAlias, oauth-model-alias / oauth.model-alias). */
+export interface OAuthModelAlias {
+  /** Upstream model id. */
+  name: string;
+  /** Client-facing id. */
+  alias: string;
+  /** Keep the upstream id listed next to the alias. */
+  fork: boolean;
+  /** Optional display name for the alias entry. */
+  displayName: string;
+  /** Route the alias to the upstream model even when the alias exists natively. */
+  forceMapping: boolean;
+}
+
+/** Per-model OAuth catalog override (upstream config.OAuthModelSetting, oauth-settings / oauth.settings). */
+export interface OAuthModelSetting {
+  /** Upstream model id (also matched against the registered id and model name). */
+  name: string;
+  /** Optional alias the setting is scoped to. */
+  alias: string;
+  /** Context window override; 0 leaves the catalog value. */
+  maxContextLength: number;
 }
 
 /** An API-key credential from one of the *-api-key lists. */
@@ -223,6 +263,12 @@ export interface Config {
   codexApiKeys: CodexApiKey[];
   /** Google AI Studio API keys (provider "aistudio"). */
   geminiApiKeys: GeminiApiKey[];
+  /** OAuth model aliases per channel (claude, codex, gemini-cli, aistudio), lower-cased keys. */
+  oauthModelAlias?: Record<string, OAuthModelAlias[]>;
+  /** Exclusion patterns per OAuth provider, lower-cased keys and patterns. */
+  oauthExcludedModels?: Record<string, string[]>;
+  /** OAuth catalog overrides per channel, lower-cased keys. */
+  oauthSettings?: Record<string, OAuthModelSetting[]>;
   /** Path the config was loaded from (unset when parsed from a string). */
   sourcePath?: string;
 }

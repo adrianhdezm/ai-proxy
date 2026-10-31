@@ -4,11 +4,14 @@
 // attribution of conductor_selection.go (availableAuthsForRouteModel,
 // latestCandidateErrorForModel, latestUnauthorizedCandidateError).
 //
-// Dropped from upstream: WeightedRoundRobinSelector, SessionAffinitySelector,
+// WeightedRoundRobinSelector (smooth weighted round-robin) and the credential
+// weight parsing of weight.go / internal/credentialweight are included.
+//
+// Dropped from upstream: SessionAffinitySelector,
 // the plugin scheduler, websocket preference and the incremental authScheduler
 // (selection recomputes availability from the auth snapshot on every pick).
 import type { ExecOptions } from "../../executor/types.ts";
-import { StatusDisabled, type Auth, type AuthError } from "../types.ts";
+import { AttributeWeight, StatusDisabled, type Auth, type AuthError } from "../types.ts";
 import { authPriority, canonicalModelKey } from "./classification.ts";
 import { AuthManagerError, ModelCooldownError, TerminalAuthError, newAuthNotFoundError, newAuthUnavailableError } from "./errors.ts";
 import { hasUnauthorizedAuthFailure } from "./state.ts";
@@ -273,5 +276,191 @@ export class RoundRobinSelector implements Selector {
 export class FillFirstSelector implements Selector {
   pick(provider: string, model: string, _opts: ExecOptions, auths: Auth[], nowMs: number): Auth {
     return getAvailableAuths(auths, provider, model, nowMs)[0]!;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Credential weights (Go: weight.go, internal/credentialweight, authWeight)
+// ---------------------------------------------------------------------------
+
+/** Weight used when a credential does not define one (Go: credentialweight.Default). */
+export const DefaultCredentialWeight = 1;
+/** Largest positive weight (Go: credentialweight.Max). */
+export const MaxAuthWeight = 1_000_000;
+
+function normalizeWeight(weight: number): number {
+  if (weight <= 0) return 0;
+  if (weight > MaxAuthWeight) throw new Error(`weight must not exceed ${MaxAuthWeight}`);
+  return weight;
+}
+
+/** Parses a scheduler attribute; "" uses the default weight (Go: credentialweight.ParseString). */
+export function parseWeightString(raw: string): number {
+  const trimmed = raw.trim();
+  if (trimmed === "") return DefaultCredentialWeight;
+  if (!/^[+-]?\d+$/.test(trimmed)) throw new Error("weight must be an integer");
+  const value = BigInt(trimmed);
+  if (value <= 0n) return 0;
+  if (value > BigInt(MaxAuthWeight)) throw new Error(`weight must not exceed ${MaxAuthWeight}`);
+  return Number(value);
+}
+
+/** Parses a JSON metadata value (Go: credentialweight.ParseValue). */
+export function parseWeightValue(value: unknown): number {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || !Number.isInteger(value)) throw new Error("weight must be an integer");
+    return normalizeWeight(value);
+  }
+  if (typeof value === "bigint") {
+    if (value <= 0n) return 0;
+    if (value > BigInt(MaxAuthWeight)) throw new Error(`weight must not exceed ${MaxAuthWeight}`);
+    return Number(value);
+  }
+  if (typeof value === "string") return parseWeightString(value);
+  throw new Error("weight must be an integer");
+}
+
+/** Validates every explicit weight source of the auth; throws on an invalid one (Go: ValidateAuthWeight). */
+export function validateAuthWeight(auth: Auth | undefined): void {
+  if (!auth) return;
+  if (auth.attributes && Object.prototype.hasOwnProperty.call(auth.attributes, AttributeWeight)) {
+    try {
+      parseWeightString(auth.attributes[AttributeWeight] ?? "");
+    } catch (err) {
+      throw new Error(`invalid attributes weight: ${(err as Error).message}`);
+    }
+  }
+  if (auth.metadata && Object.prototype.hasOwnProperty.call(auth.metadata, AttributeWeight)) {
+    try {
+      parseWeightValue(auth.metadata[AttributeWeight]);
+    } catch (err) {
+      throw new Error(`invalid metadata weight: ${(err as Error).message}`);
+    }
+  }
+}
+
+/** Effective routing weight; invalid explicit weights count as 0 (Go: authWeight). */
+export function authWeight(auth: Auth | undefined): number {
+  if (!auth) return DefaultCredentialWeight;
+  const raw = auth.attributes?.[AttributeWeight];
+  if (raw !== undefined && raw.trim() !== "") {
+    try {
+      return parseWeightString(raw);
+    } catch {
+      return 0;
+    }
+  }
+  if (auth.metadata && Object.prototype.hasOwnProperty.call(auth.metadata, AttributeWeight)) {
+    try {
+      return parseWeightValue(auth.metadata[AttributeWeight]);
+    } catch {
+      return 0;
+    }
+  }
+  return DefaultCredentialWeight;
+}
+
+export function positiveWeightAuths(auths: Auth[]): Auth[] {
+  return auths.filter((auth) => authWeight(auth) > 0);
+}
+
+/** Bounds one accumulator map so permanently removed credentials cannot leak (Go: maxSmoothWeightedStateEntries). */
+export const MaxSmoothWeightedStateEntries = 1024;
+
+/** Per (provider, model) smooth weighted state (Go: smoothWeightedState). */
+export class SmoothWeightedState {
+  current?: Map<string, number>;
+  weights?: Map<string, number>;
+
+  /**
+   * Syncs the configured weights without discarding accumulated credits; credits
+   * reset only when a credential's configured weight changes, never when the
+   * candidate set shrinks temporarily (Go: smoothWeightedState.prepare).
+   */
+  prepare(weights: Map<string, number>): void {
+    if (!this.current || weightsConfigChanged(this.weights, weights)) this.current = new Map();
+    if (!this.weights) this.weights = new Map();
+    for (const [id, weight] of weights) this.weights.set(id, weight);
+    this.pruneStale(weights);
+  }
+
+  private pruneStale(weights: Map<string, number>): void {
+    if ((this.current?.size ?? 0) <= MaxSmoothWeightedStateEntries && (this.weights?.size ?? 0) <= MaxSmoothWeightedStateEntries) return;
+    for (const id of Array.from(this.current?.keys() ?? [])) if (!weights.has(id)) this.current!.delete(id);
+    for (const id of Array.from(this.weights?.keys() ?? [])) if (!weights.has(id)) this.weights!.delete(id);
+  }
+}
+
+/** Whether a credential present in both vectors changed its weight (Go: weightsConfigChanged). */
+export function weightsConfigChanged(left: Map<string, number> | undefined, right: Map<string, number>): boolean {
+  if (!left || left.size === 0) return false;
+  for (const [id, weight] of right) {
+    const previous = left.get(id);
+    if (previous !== undefined && previous !== weight) return true;
+  }
+  return false;
+}
+
+export function authWeightVector(auths: Auth[]): Map<string, number> {
+  const weights = new Map<string, number>();
+  for (const auth of auths) {
+    if (!auth) continue;
+    const weight = authWeight(auth);
+    if (weight > 0) weights.set(auth.id, weight);
+  }
+  return weights;
+}
+
+/** Nginx-style smooth weighted pick over `auths` in order (Go: pickSmoothWeightedAuth). */
+export function pickSmoothWeightedAuth(auths: Auth[], current: Map<string, number>): Auth | undefined {
+  let picked: Auth | undefined;
+  let pickedCurrent = 0;
+  let total = 0;
+  for (const auth of auths) {
+    const weight = authWeight(auth);
+    if (!auth || weight <= 0) continue;
+    const next = (current.get(auth.id) ?? 0) + weight;
+    current.set(auth.id, next);
+    total += weight;
+    if (!picked || next > pickedCurrent) {
+      picked = auth;
+      pickedCurrent = next;
+    }
+  }
+  if (!picked) return undefined;
+  current.set(picked.id, (current.get(picked.id) ?? 0) - total);
+  return picked;
+}
+
+/**
+ * Smooth weighted round-robin across the highest available priority tier.
+ * Credentials with a non-positive weight are excluded (Go: WeightedRoundRobinSelector).
+ */
+export class WeightedRoundRobinSelector implements Selector {
+  private states = new Map<string, SmoothWeightedState>();
+  private readonly maxKeys: number;
+
+  constructor(options: { maxKeys?: number } = {}) {
+    this.maxKeys = options.maxKeys && options.maxKeys > 0 ? options.maxKeys : 4096;
+  }
+
+  pick(provider: string, model: string, _opts: ExecOptions, auths: Auth[], nowMs: number): Auth {
+    const available = getAvailableAuths(positiveWeightAuths(auths), provider, model, nowMs);
+    const key = `${provider}:${canonicalModelKey(model)}`;
+    if (!this.states.has(key) && this.states.size >= this.maxKeys) this.states = new Map();
+    let state = this.states.get(key);
+    if (!state) {
+      state = new SmoothWeightedState();
+      this.states.set(key, state);
+    }
+    state.prepare(authWeightVector(available));
+    const picked = pickSmoothWeightedAuth(available, state.current!);
+    if (!picked) throw new AuthManagerError("auth_unavailable", "no auth available with positive weight");
+    return picked;
+  }
+
+  /** Accumulator state keyed by provider:model (exposed for tests). */
+  stateFor(provider: string, model: string): SmoothWeightedState | undefined {
+    return this.states.get(`${provider}:${canonicalModelKey(model)}`);
   }
 }

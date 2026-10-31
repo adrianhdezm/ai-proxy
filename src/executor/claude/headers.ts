@@ -243,8 +243,9 @@ export function applyClaudeHeaders(o: ApplyClaudeHeadersOptions): void {
     if (isClaudeHaikuModel(reqModel) && getAt(root, "fallbacks") === undefined) baseBetas = withoutClaudeBeta(baseBetas, claudeServerSideFallbackBeta);
     if (getAt(root, "thinking.block_binding") !== undefined) baseBetas = withClaudeBetaAppended(baseBetas, claudeThinkingBindingBeta);
     let emitted = baseBetas;
-    for (const beta of hd?.anthropicBetaStrip ?? []) emitted = withoutClaudeBeta(emitted, beta);
-    for (const beta of hd?.anthropicBetaAppend ?? []) emitted = withClaudeBetaAppended(emitted, beta);
+    // Operator lists are trimmed like the Go config normalizer does; empty entries are ignored.
+    for (const beta of hd?.anthropicBetaStrip ?? []) if (beta.trim() !== "") emitted = withoutClaudeBeta(emitted, beta.trim());
+    for (const beta of hd?.anthropicBetaAppend ?? []) if (beta.trim() !== "") emitted = withClaudeBetaAppended(emitted, beta.trim());
     if (emitted.trim() === "") r.delete("Anthropic-Beta");
     else r.set("Anthropic-Beta", emitted);
   };

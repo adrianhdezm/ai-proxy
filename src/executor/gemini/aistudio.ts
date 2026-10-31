@@ -35,6 +35,8 @@ import {
 } from "./request.ts";
 import { type ExecutorFetch, geminiStreamChunks, postUpstream } from "./stream.ts";
 import { parseGeminiUsage } from "./usage.ts";
+import { newResponseModelReporter, publishResponseModelAfter } from "../response_model.ts";
+import { effectiveProxyURL } from "../proxy.ts";
 
 export const AIStudioExecutorIdentifier = "aistudio";
 /** glEndpoint. */
@@ -118,7 +120,7 @@ export class AIStudioExecutor implements ProviderExecutor {
   }
 
   private proxyFor(auth: Auth, opts: ExecOptions): string | undefined {
-    return opts.proxyUrl ?? (auth.proxyUrl && auth.proxyUrl !== "" ? auth.proxyUrl : this.globalProxy);
+    return effectiveProxyURL(opts.proxyUrl, auth.proxyUrl, this.globalProxy);
   }
 
   private url(auth: Auth, model: string, action: Action, query: string): string {
@@ -151,6 +153,11 @@ export class AIStudioExecutor implements ProviderExecutor {
     });
     const data = await resp.text();
     if (resp.status < 200 || resp.status >= 300) throw newGeminiStatusErr(resp.status, data, resp.headers);
+    if (action === "generateContent") {
+      const reporter = newResponseModelReporter(this.identifier, req.model, auth);
+      reporter.observeResponseModel(data);
+      reporter.publish();
+    }
     const blockMsg = geminiPromptBlockErrorMessage(data);
     if (blockMsg !== undefined) throw newGeminiPromptBlockErr(blockMsg);
     const state: TranslatorState = {};
@@ -180,9 +187,10 @@ export class AIStudioExecutor implements ProviderExecutor {
       const data = await resp.text();
       throw newGeminiStatusErr(resp.status, data, resp.headers);
     }
+    const reporter = newResponseModelReporter(this.identifier, req.model, auth);
     return {
       headers: resp.headers,
-      chunks: geminiStreamChunks({
+      chunks: publishResponseModelAfter(geminiStreamChunks({
         response: resp,
         responseFormat,
         model: req.model,
@@ -192,7 +200,8 @@ export class AIStudioExecutor implements ProviderExecutor {
         detectPromptBlock: true,
         dataLinesOnly: false,
         signal: opts.signal,
-      }),
+        onPayload: (payload) => reporter.observeResponseModel(payload),
+      }), reporter),
     };
   }
 

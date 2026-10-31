@@ -11,6 +11,7 @@ import { log } from "../../log.ts";
 import { defaultRegistry } from "../../translator/registry.ts";
 import { FormatClaude, FormatGemini, FormatOpenAI, FormatOpenAIResponse, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
 import { StatusError } from "../types.ts";
+import { fetchProxyOption } from "../proxy.ts";
 import { applyPatchTranslationError, applyPatchUpstreamError, ensureResponsesUsageDetails, finalizeApplyPatchStream, initializeApplyPatchStream } from "../responses.ts";
 import {
   geminiPromptBlockErrorMessage,
@@ -34,8 +35,8 @@ export interface UpstreamRequest {
 /** POSTs the JSON body upstream (proxy "" / "direct" means no proxy). */
 export async function postUpstream(fetchFn: ExecutorFetch, req: UpstreamRequest): Promise<Response> {
   const init: RequestInit & { proxy?: string } = { method: "POST", headers: req.headers, body: req.body, signal: req.signal };
-  const proxy = (req.proxyUrl ?? "").trim();
-  if (proxy !== "" && proxy.toLowerCase() !== "direct") init.proxy = proxy;
+  const proxy = fetchProxyOption(req.proxyUrl ?? "");
+  if (proxy !== undefined) init.proxy = proxy;
   return fetchFn(req.url, init);
 }
 

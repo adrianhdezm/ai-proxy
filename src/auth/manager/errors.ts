@@ -8,7 +8,8 @@
 // Dropped from upstream: the trustedRetryAfterError / upstreamExecutionAttempt
 // wrappers (the manager hands the original StatusError back and the HTTP layer
 // derives Retry-After from `retryAfterMs`), Home round errors, websocket turn
-// errors, Cloudflare challenge detection and the connection-lifecycle class.
+// errors and the typed configured-TLS-handshake timeout (Bun fetch has no
+// configurable handshake bound).
 import { StatusError, statusCodeOf } from "../../executor/types.ts";
 import type { AuthError } from "../types.ts";
 
@@ -18,6 +19,8 @@ export const ErrorCodeStreamTruncated = "stream_truncated";
 export const ErrorCodeTransientRateLimit = "transient_rate_limit";
 export const ErrorCodeForceCooldown = "force_cooldown";
 export const ErrorCodeModelNotFound = "model_not_found";
+/** Transport/session lifecycle failures (client abort, EOF, websocket close) that never cool credentials. */
+export const ErrorCodeConnectionLifecycle = "connection_lifecycle";
 
 /**
  * Provider agnostic failure raised by the manager itself (selection, refresh,
@@ -403,21 +406,31 @@ export function isRequestInvalidError(err: unknown): boolean {
 }
 
 const transientTransportPatterns = [
-  "connection reset",
+  // Go: isTransientTransportMessage
+  "tls: tls handshake",
+  "tls handshake timeout",
+  "wsarecv",
+  "wsasend",
+  "a connection attempt failed",
   "connection refused",
+  "connection reset",
+  "i/o timeout",
+  "no such host",
+  "server misbehaving",
+  "network is unreachable",
+  "no route to host",
   "broken pipe",
+  "connection aborted",
+  "use of closed network connection",
+  "unexpected eof",
+  // Bun/Node fetch spellings of the same failures
   "econnreset",
   "econnrefused",
   "etimedout",
   "enotfound",
   "eai_again",
   "epipe",
-  "unexpected eof",
   "unexpected end of",
-  "tls handshake timeout",
-  "i/o timeout",
-  "network is unreachable",
-  "no such host",
   "socket hang up",
   "fetch failed",
   "connection closed",
@@ -426,17 +439,80 @@ const transientTransportPatterns = [
   "timed out",
 ];
 
+/** x/net/http2 closed-connection errors (Go: isHTTP2ClosedConnectionMessage). */
+function isHTTP2ClosedConnectionMessage(lower: string): boolean {
+  return lower.includes("http2: client connection force closed via clientconn.close") || lower.includes("http2: client conn is closed");
+}
+
+function isTransientTransportMessage(message: string): boolean {
+  const lower = message.trim().toLowerCase();
+  if (lower === "") return false;
+  return transientTransportPatterns.some((pattern) => lower.includes(pattern)) || isHTTP2ClosedConnectionMessage(lower);
+}
+
 /** Pre-HTTP dial/TLS/DNS/reset failures that skip cooldown but allow retry rounds (Go: isTransientTransportError). */
 export function isTransientTransportError(err: unknown): boolean {
   if (err === undefined || err === null) return false;
   if (errorStatus(err) !== 0) return false;
   if (err instanceof AuthManagerError) return err.code === ErrorCodeTransientTransport;
-  if (err instanceof Error && err.name === "AbortError") return false;
+  // Caller-owned cancellation and deadlines are never transport failures.
+  if (isAbortError(err)) return false;
   const code = err && typeof err === "object" ? (err as { code?: unknown }).code : undefined;
   if (typeof code === "string" && /^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|ECONNABORTED|EHOSTUNREACH|ENETUNREACH)$/.test(code)) return true;
-  const lower = errorText(err).toLowerCase();
+  return isTransientTransportMessage(errorText(err));
+}
+
+/**
+ * Transport/session lifecycle failures that must not cool credentials: client
+ * cancellation, caller deadlines, EOF and websocket/HTTP2 close disconnects
+ * (Go: isConnectionLifecycleError). Status-bearing errors always stay coolable.
+ */
+export function isConnectionLifecycleError(err: unknown): boolean {
+  if (err === undefined || err === null) return false;
+  if (err instanceof Error && err.name === "CodexWebsocketCloseError") {
+    const code = (err as { code?: unknown }).code;
+    if (code === 1000 || code === 1001 || code === 1006) return true;
+  }
+  if (errorStatus(err) !== 0) return false;
+  if (isAbortError(err)) return true;
+  return isConnectionLifecycleMessage(errorText(err));
+}
+
+/** Go: isConnectionLifecycleMessage. */
+export function isConnectionLifecycleMessage(message: string): boolean {
+  const lower = message.trim().toLowerCase();
   if (lower === "") return false;
-  return transientTransportPatterns.some((pattern) => lower.includes(pattern));
+  if (lower === "context canceled" || lower === "context deadline exceeded" || lower === "eof" || lower === "unexpected eof") return true;
+  if (lower.includes("websocket: close 1000") || lower.includes("websocket: close 1001") || lower.includes("websocket: close 1006")) return true;
+  return lower.includes("unexpected eof") || isHTTP2ClosedConnectionMessage(lower);
+}
+
+export function isConnectionLifecycleResultError(err: AuthError | undefined): boolean {
+  if (!err) return false;
+  if (err.code === ErrorCodeConnectionLifecycle) return true;
+  if (err.code === ErrorCodeTransientTransport) return false;
+  // Message fallback only without an HTTP status, so 401/429/5xx bodies cannot suppress cooldown.
+  if (statusCodeFromResult(err) !== 0) return false;
+  return isConnectionLifecycleMessage(err.message);
+}
+
+/** Cloudflare bot/WAF challenge markers (Go: isCloudflareChallengeErrorMessage). */
+export function isCloudflareChallengeErrorMessage(message: string): boolean {
+  const lower = message.trim().toLowerCase();
+  return lower.includes("challenge-platform") || lower.includes("cf-mitigated") || lower.includes("cloudflare challenge") || (lower.includes("just a moment") && lower.includes("cloudflare"));
+}
+
+/** A Cloudflare challenge (served with 403); HTTP >= 500 origin failures (520-526) take precedence (Go: isCloudflareChallengeError). */
+export function isCloudflareChallengeError(err: unknown): boolean {
+  if (err === undefined || err === null) return false;
+  if (errorStatus(err) >= 500) return false;
+  return isCloudflareChallengeErrorMessage(errorText(err));
+}
+
+export function isCloudflareChallengeResultError(err: AuthError | undefined): boolean {
+  if (!err) return false;
+  if (statusCodeFromResult(err) >= 500) return false;
+  return isCloudflareChallengeErrorMessage(err.message);
 }
 
 export function isAbortError(err: unknown): boolean {
@@ -466,6 +542,9 @@ export function resultErrorFromError(err: unknown): AuthError | undefined {
     if (!result.code || result.code === ErrorCodeRequestScoped) result.code = ErrorCodeModelNotFound;
   } else if (isRequestScopedError(err) || isRequestInvalidError(err)) {
     result.code = ErrorCodeRequestScoped;
+  } else if (isConnectionLifecycleError(err)) {
+    // Lifecycle classification for markResult without making the error request-scoped.
+    if (!result.code || result.code === ErrorCodeConnectionLifecycle) result.code = ErrorCodeConnectionLifecycle;
   } else if (isTransientTransportError(err)) {
     if (!result.code || result.code === ErrorCodeTransientTransport) result.code = ErrorCodeTransientTransport;
   }
@@ -477,7 +556,12 @@ export function isRequestScopedResultError(err: AuthError | undefined): boolean 
 }
 
 export function isTransientTransportResultError(err: AuthError | undefined): boolean {
-  return !!err && err.code === ErrorCodeTransientTransport;
+  if (!err) return false;
+  if (err.code === ErrorCodeTransientTransport) return true;
+  if (statusCodeFromResult(err) !== 0) return false;
+  // Matching text alone must not promote a handshake-timeout phrase (Go: isTransientTransportResultError).
+  if (err.message.toLowerCase().includes("tls handshake timeout")) return false;
+  return isTransientTransportMessage(err.message);
 }
 
 export function isStreamTruncatedResultError(err: AuthError | undefined): boolean {
@@ -491,7 +575,7 @@ export function isTransientRateLimitResultError(err: AuthError | undefined): boo
 /** Failures that must not mark auth/model cooling (Go: shouldSkipCredentialCooldown). */
 export function shouldSkipCredentialCooldown(err: AuthError | undefined): boolean {
   if (err && err.code === ErrorCodeForceCooldown) return false;
-  return isRequestScopedResultError(err) || isTransientTransportResultError(err) || isStreamTruncatedResultError(err);
+  return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err) || isStreamTruncatedResultError(err);
 }
 
 export function statusCodeFromResult(err: AuthError | undefined): number {

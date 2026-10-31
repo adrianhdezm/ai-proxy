@@ -5,12 +5,12 @@
 // hasModelError, clearAuthStateOnSuccess and the per-model branch of MarkResult
 // (applyModelFailureState here).
 //
-// Dropped from upstream: Cloudflare challenge cooldowns, the credential-quota
-// shadow layers (issue #6690), Devin quota revalidation and persisted cooldown
+// Dropped from upstream: the credential-quota shadow layers (issue #6690), Devin quota revalidation and persisted cooldown
 // state records.
 import { StatusActive, StatusDisabled, StatusError, emptyQuotaState, type Auth, type AuthError, type ModelState } from "../types.ts";
 import {
   ErrorCodeForceCooldown,
+  isCloudflareChallengeResultError,
   isInvalidGrantResultError,
   isModelSupportResultError,
   isTransientRateLimitResultError,
@@ -91,6 +91,14 @@ export function quotaCooldownAfterFailure(quota: { nextRecoverAt: number; backof
 
 function quotaRetryAfterWithFloor(nowMs: number, retryAfterMs: number): number {
   return nowMs + Math.max(retryAfterMs, MinQuotaCooldownFloorMs);
+}
+
+/** Exponential cooldown with a 10s floor for Cloudflare challenges (Go: nextCloudflareCooldown). */
+export function nextCloudflareCooldown(backoffLevel: number, disableCooling: boolean, nowMs: number): { next: number; level: number } {
+  if (disableCooling) return { next: 0, level: backoffLevel };
+  let { cooldownMs, level } = nextQuotaCooldown(backoffLevel, disableCooling);
+  if (cooldownMs < MinQuotaCooldownFloorMs) cooldownMs = MinQuotaCooldownFloorMs;
+  return { next: cooldownMs > 0 ? nowMs + cooldownMs : 0, level };
 }
 
 /** Whether any model state still carries an error (Go: hasModelError). */
@@ -212,6 +220,11 @@ export function applyAuthFailureState(auth: Auth, resultErr: AuthError | undefin
     if (next === 0 && auth.quota.exceeded && auth.quota.nextRecoverAt > nowMs) next = auth.quota.nextRecoverAt;
     auth.nextRetryAfter = next;
     auth.unavailable = next !== 0;
+  } else if (isCloudflareChallengeResultError(resultErr)) {
+    auth.statusMessage = "cloudflare challenge";
+    const { next, level } = nextCloudflareCooldown(auth.quota.backoffLevel ?? 0, disableCooling, nowMs);
+    applyCooldownFields(auth.quota, { exceeded: true, reason: "cloudflare challenge", nextRecoverAt: next, backoffLevel: level });
+    auth.nextRetryAfter = next;
   } else if (isInvalidGrantResultError(resultErr)) {
     auth.statusMessage = "invalid_grant";
     auth.nextRetryAfter = disableCooling ? 0 : nowMs + 30 * 60 * 1000;
@@ -316,6 +329,12 @@ export function applyModelFailureState(auth: Auth, state: ModelState, input: Mod
     if (disableCooling) state.nextRetryAfter = 0;
     else if (retryAfterMs !== undefined && retryAfterMs > 0) state.nextRetryAfter = nowMs + retryAfterMs;
     else state.nextRetryAfter = nowMs + 12 * 60 * 60 * 1000;
+  } else if (isCloudflareChallengeResultError(resultErr)) {
+    const { next, level } = nextCloudflareCooldown(state.quota.backoffLevel ?? 0, disableCooling, nowMs);
+    state.nextRetryAfter = next;
+    state.statusMessage = "cloudflare challenge";
+    if (auth.lastError && !wasTerminalUnauthorized) auth.statusMessage = "cloudflare challenge";
+    applyCooldownFields(state.quota, { exceeded: true, reason: "cloudflare challenge", nextRecoverAt: next, backoffLevel: level });
   } else if (isInvalidGrantResultError(resultErr)) {
     state.nextRetryAfter = disableCooling ? 0 : nowMs + 30 * 60 * 1000;
   } else if (isTransientRateLimitResultError(resultErr) && statusCode === 429) {

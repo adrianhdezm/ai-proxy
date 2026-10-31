@@ -179,28 +179,109 @@ export function computeExcludedModelsHash(excluded: string[]): string {
 /** Stable hash of a credential's model overrides ("" when none). */
 export function computeModelsHash(models: ModelOverride[] | undefined): string {
   if (!models || models.length === 0) return "";
-  const canonical = models.map((m) => ({
-    name: m.name,
-    alias: m.alias,
-    displayName: m.displayName,
-    maxContextLength: m.maxContextLength,
-    isCompat: m.isCompat,
-    forceMapping: m.forceMapping,
-    thinking: m.thinking ?? null,
-  }));
+  const canonical = models.map((m) => {
+    const entry: Record<string, unknown> = {
+      name: m.name,
+      alias: m.alias,
+      displayName: m.displayName,
+      maxContextLength: m.maxContextLength,
+      isCompat: m.isCompat,
+      forceMapping: m.forceMapping,
+      thinking: m.thinking ?? null,
+    };
+    // Optional knobs join the hash only when set, so existing hashes stay stable.
+    if (m.supportConfigurationUpdate !== undefined) entry.supportConfigurationUpdate = m.supportConfigurationUpdate;
+    if (m.useMaxCompletionTokens !== undefined) entry.useMaxCompletionTokens = m.useMaxCompletionTokens;
+    if (m.inputModalities !== undefined) entry.inputModalities = m.inputModalities;
+    return entry;
+  });
   return sha256Hex(JSON.stringify(canonical));
 }
 
 /**
- * Returns the model overrides configured for a synthesized API-key auth
- * (looked up by provider and config_index), or [] for OAuth auths.
+ * Returns the model overrides configured for an API-key auth (resolved with
+ * resolveConfigEntry), or [] when no config entry applies (OAuth auths).
  */
 export function modelOverridesFor(cfg: Config, auth: Auth): ModelOverride[] {
-  if (auth.attributes[AttributeSourceBackend] !== AuthSourceConfig) return [];
-  const index = Number(auth.attributes[AttributeConfigIndex]);
-  if (!Number.isInteger(index) || index < 0) return [];
-  const list = entriesForProvider(cfg, auth.provider);
-  return list[index]?.models ?? [];
+  return resolveConfigEntry(cfg, auth)?.models ?? [];
+}
+
+/**
+ * Finds the config entry an auth was synthesised from (Go: resolveConfigClaudeKey,
+ * resolveConfigGeminiKey, resolveConfigCodexKey). A config-sourced auth's
+ * config_index is tried first; for codex and openai keys the indexed entry must
+ * still carry the auth's API key and base URL, so a stale index never applies
+ * another credential's models. Otherwise the entries are matched by API key and
+ * base URL.
+ */
+export function resolveConfigEntry(cfg: Config | undefined | null, auth: Auth | undefined | null): ApiKeyCredential | undefined {
+  if (!cfg || !auth) return undefined;
+  const provider = (auth.provider ?? "").trim().toLowerCase();
+  const entries = entriesForProvider(cfg, provider);
+  if (entries.length === 0) return undefined;
+  const attrKey = (auth.attributes?.[AttributeAPIKey] ?? "").trim();
+  const attrBase = (auth.attributes?.[AttributeBaseURL] ?? "").trim();
+  const indexed = configEntryForAuthIndex(auth, entries);
+  switch (provider) {
+    case "claude":
+      return indexed ?? matchClaudeEntry(entries, attrKey, attrBase);
+    case "aistudio":
+      return indexed ?? matchGeminiEntry(entries, attrKey, attrBase);
+    default: {
+      const matches = (entry: ApiKeyCredential): boolean => codexStyleMatch(entry, attrKey, attrBase);
+      if (indexed && matches(indexed)) return indexed;
+      return entries.find(matches);
+    }
+  }
+}
+
+function configEntryForAuthIndex(auth: Auth, entries: ApiKeyCredential[]): ApiKeyCredential | undefined {
+  const fromConfig =
+    (auth.attributes?.[AttributeSourceBackend] ?? "").trim().toLowerCase() === AuthSourceConfig ||
+    (auth.attributes?.[AttributeSource] ?? "").trim().toLowerCase().startsWith(`${AuthSourceConfig}:`);
+  if (!fromConfig) return undefined;
+  const raw = (auth.attributes[AttributeConfigIndex] ?? "").trim();
+  if (!/^\d+$/.test(raw)) return undefined;
+  return entries[Number(raw)];
+}
+
+function equalFold(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
+function matchClaudeEntry(entries: ApiKeyCredential[], attrKey: string, attrBase: string): ApiKeyCredential | undefined {
+  for (const entry of entries) {
+    const cfgKey = entry.apiKey.trim();
+    const cfgBase = entry.baseUrl.trim();
+    if (attrKey !== "" && attrBase !== "") {
+      if (equalFold(cfgKey, attrKey) && equalFold(cfgBase, attrBase)) return entry;
+      continue;
+    }
+    if (attrKey !== "" && equalFold(cfgKey, attrKey) && (cfgBase === "" || equalFold(cfgBase, attrBase))) return entry;
+    if (attrKey === "" && attrBase !== "" && equalFold(cfgBase, attrBase)) return entry;
+  }
+  if (attrKey !== "") return entries.find((entry) => equalFold(entry.apiKey.trim(), attrKey));
+  return undefined;
+}
+
+function matchGeminiEntry(entries: ApiKeyCredential[], attrKey: string, attrBase: string): ApiKeyCredential | undefined {
+  for (const entry of entries) {
+    const cfgKey = entry.apiKey.trim();
+    const cfgBase = entry.baseUrl.trim();
+    if (attrKey !== "" && equalFold(cfgKey, attrKey)) {
+      if (cfgBase === "" || equalFold(cfgBase, attrBase)) return entry;
+      continue;
+    }
+    if (attrKey === "" && attrBase !== "" && equalFold(cfgBase, attrBase)) return entry;
+  }
+  return undefined;
+}
+
+function codexStyleMatch(entry: ApiKeyCredential, attrKey: string, attrBase: string): boolean {
+  const cfgKey = entry.apiKey.trim();
+  const cfgBase = entry.baseUrl.trim();
+  if (attrKey !== "") return equalFold(cfgKey, attrKey) && (cfgBase === "" || equalFold(cfgBase, attrBase));
+  return attrBase !== "" && equalFold(cfgBase, attrBase);
 }
 
 function entriesForProvider(cfg: Config, provider: string): ApiKeyCredential[] {

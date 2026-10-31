@@ -41,3 +41,4 @@ export {
   modelOverrideHeaders,
 } from "./model_registry.ts";
 export { type ModelAlias, applyModelAliases, applyExcludedModels, matchWildcard, rewriteModelInfoName } from "./aliases.ts";
+export { resolveModelInfo, normalizeThinkingSupport } from "./model_config.ts";

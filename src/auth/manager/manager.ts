@@ -5,8 +5,12 @@
 // ExecuteStream / ExecuteCount / executeMixedOnce), conductor_stream.go,
 // conductor_cooldown.go (MarkResult, ResetQuota) and conductor_refresh.go.
 //
+// API-key model aliases and routing prefixes are resolved per credential
+// before the executor runs (models.ts); the weighted selector is chosen from
+// routing.strategy when a config is supplied.
+//
 // Dropped from upstream: Home mode, plugin schedulers, session affinity,
-// weighted selection, OAuth/API-key model alias pools, request interceptors,
+// OAuth model aliases, OpenAI-compatibility alias pools, request interceptors,
 // RequestAuthPreparer, antigravity credits fallback, Home execution-session auths, SIWC,
 // Devin quota revalidation, cooldown state stores and registration epochs.
 import {
@@ -19,6 +23,7 @@ import {
   type ProviderExecutor,
   type StreamResult,
 } from "../../executor/types.ts";
+import type { Config } from "../../config/types.ts";
 import { log } from "../../log.ts";
 import { getGlobalRegistry, type ClientModelProjection, type ModelRegistry } from "../../registry/index.ts";
 import { normalizeCredentialMetadata } from "../../store/record.ts";
@@ -76,7 +81,8 @@ import {
   type RefreshLeadResolver,
   type RefreshTimers,
 } from "./refresh.ts";
-import { RoundRobinSelector, availabilityBlock, isAuthBlockedForModel, type BlockState, type Selector } from "./selector.ts";
+import { attachResolvedAPIKeyModelInfo, compileAPIKeyModelAlias, configuredModelOverrides, lookupAPIKeyUpstreamModel, resolveAPIKeyModelAliasWithResult, resolveExecutionModel, type ModelAliasResult } from "./models.ts";
+import { FillFirstSelector, RoundRobinSelector, WeightedRoundRobinSelector, availabilityBlock, isAuthBlockedForModel, validateAuthWeight, type BlockState, type Selector } from "./selector.ts";
 import {
   clearCooldownStateForAuth,
   clearUnauthorizedModelStates,
@@ -112,6 +118,13 @@ export interface ExecutionResult {
    * means unknown and is exempt from the ordering guard.
    */
   executionSeq?: number;
+  /**
+   * Credential version the execution ran under (Go: Result.CredentialVersion).
+   * A failure from a superseded credential never cools the replacement.
+   */
+  credentialVersion?: number;
+  /** Access token the execution used; a result for the current token is never stale. */
+  accessToken?: string;
 }
 
 export interface AuthManagerOptions {
@@ -131,6 +144,34 @@ export interface AuthManagerOptions {
   random?: () => number;
   /** Global disable-cooling flag (config.disable-cooling). */
   cooldownDisabled?: boolean;
+  /**
+   * Runtime config: API-key model aliases/capabilities are resolved from its
+   * *-api-key lists, and routing.strategy picks the selector when `selector`
+   * is not given (Go: Manager.SetConfig).
+   */
+  config?: Config;
+}
+
+/** Selector for a routing.strategy value: fill-first, weighted-round-robin, otherwise round-robin (Go: selector switch in sdk/cliproxy/builder.go). */
+export function selectorForStrategy(strategy: string | undefined): Selector {
+  switch ((strategy ?? "").trim().toLowerCase()) {
+    case "fill-first":
+    case "fillfirst":
+    case "ff":
+      return new FillFirstSelector();
+    case "weighted-round-robin":
+    case "weighted":
+    case "wrr":
+      return new WeightedRoundRobinSelector();
+    default:
+      return new RoundRobinSelector();
+  }
+}
+
+/** Register/update options (Go: WithSkipPersist). */
+export interface MutationOptions {
+  /** Do not write this mutation to the token store. */
+  skipPersist?: boolean;
 }
 
 export interface ForceRefreshResult {
@@ -139,10 +180,23 @@ export interface ForceRefreshResult {
   error?: string;
 }
 
+/** Asks an executor to release all of its execution sessions (Go: CloseAllExecutionSessionsID). */
+export const CloseAllExecutionSessionsID = "__all_execution_sessions__";
+
 export interface SelectedAuth {
   auth: Auth;
   executor: ProviderExecutor;
   provider: string;
+}
+
+interface DispatchStamp {
+  executionSeq: number;
+  credentialVersion: number;
+  accessToken: string;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
 }
 
 interface RoundState {
@@ -250,6 +304,14 @@ function preferredExecutionAttemptError(fallback: unknown, upstream: unknown): u
 export class AuthManager {
   private readonly store?: TokenStore;
   private readonly selector: Selector;
+  private config?: Config;
+  /** Monotonic credential versions (Go: Auth.CredentialVersion), bumped when secrets change. */
+  private readonly credentialVersions = new Map<string, number>();
+  /**
+   * Access tokens rejected with 401 whose refresh is still running; the
+   * credential is not selected until the refresh settles (Go: RejectedAccessToken, issue #6415).
+   */
+  private readonly pendingRejectedTokens = new Map<string, string>();
   private readonly registry: ModelRegistry;
   private readonly nowFn: () => number;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -275,7 +337,8 @@ export class AuthManager {
 
   constructor(options: AuthManagerOptions = {}) {
     this.store = options.store;
-    this.selector = options.selector ?? new RoundRobinSelector();
+    this.config = options.config;
+    this.selector = options.selector ?? selectorForStrategy(options.config?.routing?.strategy);
     this.registry = options.registry ?? getGlobalRegistry();
     this.nowFn = options.now ?? (() => Date.now());
     this.sleepFn = options.sleep ?? realSleep;
@@ -304,6 +367,20 @@ export class AuthManager {
     return { requestRetry: this.requestRetry, maxRetryIntervalMs: this.maxRetryIntervalMs, maxRetryCredentials: this.maxRetryCredentials };
   }
 
+  /** Replaces the runtime config used for API-key model routing (Go: SetConfig, alias hot reload). */
+  setConfig(config: Config | undefined): void {
+    this.config = config;
+  }
+
+  runtimeConfig(): Config | undefined {
+    return this.config;
+  }
+
+  /** The selector in use. */
+  currentSelector(): Selector {
+    return this.selector;
+  }
+
   /** Global disable-cooling switch for this manager (config.disable-cooling). */
   setCooldownDisabled(disabled: boolean): void {
     this.cooldownDisabled = disabled;
@@ -324,10 +401,13 @@ export class AuthManager {
   registerExecutor(executor: ProviderExecutor): void {
     const provider = (executor?.identifier ?? "").trim().toLowerCase();
     if (provider === "") return;
+    const replaced = this.executors.get(provider);
     this.executors.set(provider, executor);
     for (const auth of this.auths.values()) {
       if (executorKeyFromAuth(auth) === provider) this.refreshLoop?.reschedule(auth.id);
     }
+    // Go: RegisterExecutor releases every execution session of the executor it replaces.
+    if (replaced && replaced !== executor) (replaced as ProviderExecutor & ExecutionSessionCloser).closeExecutionSession?.(CloseAllExecutionSessionsID);
   }
 
   unregisterExecutor(provider: string): void {
@@ -344,8 +424,12 @@ export class AuthManager {
   // Registry
   // -------------------------------------------------------------------------
 
-  /** Inserts (or replaces) an auth entry; the caller registers its models in the model registry (Go: Register). */
-  register(input: Auth): Auth {
+  /**
+   * Inserts (or replaces) an auth entry; the caller registers its models in the
+   * model registry. Throws on an invalid explicit weight (Go: Register).
+   */
+  register(input: Auth, options: MutationOptions = {}): Auth {
+    validateAuthWeight(input);
     const auth = cloneAuth(input);
     if (!auth.attributes) auth.attributes = {};
     if (!auth.metadata) auth.metadata = {};
@@ -360,10 +444,14 @@ export class AuthManager {
     if (auth.nextRetryAfter === undefined) auth.nextRetryAfter = 0;
     normalizeModelStates(auth);
     if (this.cooldownDisabledForAuth(auth) || auth.disabled || auth.status === StatusDisabled) clearCooldownStateForAuth(auth, now);
+    const previous = this.auths.get(auth.id);
+    const previousVersion = this.credentialVersions.get(auth.id) ?? 0;
+    this.credentialVersions.set(auth.id, previous && previousVersion > 0 ? (credentialsChanged(previous, auth) ? previousVersion + 1 : previousVersion) : 1);
+    this.pendingRejectedTokens.delete(auth.id);
     this.auths.set(auth.id, auth);
     this.authCooldownSeq.delete(auth.id);
     this.modelCooldownSeq.delete(auth.id);
-    this.persist(auth);
+    if (!options.skipPersist) this.persist(auth);
     this.syncRegistryProjections(auth);
     this.refreshLoop?.reschedule(auth.id);
     return cloneAuth(auth);
@@ -376,9 +464,10 @@ export class AuthManager {
    * released; a live credential-wide quota is always kept. Missing ids are a
    * no-op returning undefined (Go: Update, replace mode).
    */
-  update(input: Auth): Auth | undefined {
+  update(input: Auth, options: MutationOptions = {}): Auth | undefined {
     const existing = this.auths.get(input?.id ?? "");
     if (!existing) return undefined;
+    validateAuthWeight(input);
     const auth = cloneAuth(input);
     if (!auth.attributes) auth.attributes = {};
     if (!auth.metadata) auth.metadata = {};
@@ -432,8 +521,12 @@ export class AuthManager {
     auth.updatedAt = now;
     normalizeModelStates(auth);
     if (this.cooldownDisabledForAuth(auth) || auth.disabled || auth.status === StatusDisabled) clearCooldownStateForAuth(auth, now);
+    if (credChanged) {
+      this.credentialVersions.set(auth.id, (this.credentialVersions.get(auth.id) ?? 1) + 1);
+      this.pendingRejectedTokens.delete(auth.id);
+    }
     this.auths.set(auth.id, auth);
-    this.persist(auth);
+    if (!options.skipPersist) this.persist(auth);
     this.syncRegistryProjections(auth);
     this.refreshLoop?.reschedule(auth.id);
     return cloneAuth(auth);
@@ -446,6 +539,8 @@ export class AuthManager {
     const removed = this.auths.get(key)!;
     this.auths.delete(key);
     this.generations.delete(key);
+    this.credentialVersions.delete(key);
+    this.pendingRejectedTokens.delete(key);
     this.authCooldownSeq.delete(key);
     this.modelCooldownSeq.delete(key);
     this.refreshLoop?.remove(key);
@@ -475,8 +570,17 @@ export class AuthManager {
     if (!this.store) return;
     const items = await this.store.list();
     this.auths.clear();
+    this.credentialVersions.clear();
+    this.pendingRejectedTokens.clear();
     for (const item of items) {
       if (!item || !item.id) continue;
+      try {
+        validateAuthWeight(item);
+      } catch (err) {
+        // Go: Load skips credentials with an invalid explicit weight.
+        log.warn(`skipping auth ${item.id}:`, err instanceof Error ? err.message : String(err));
+        continue;
+      }
       const auth = cloneAuth(item);
       if (!auth.attributes) auth.attributes = {};
       if (!auth.metadata) auth.metadata = {};
@@ -485,6 +589,7 @@ export class AuthManager {
       if (!auth.status) auth.status = auth.disabled ? StatusDisabled : StatusActive;
       normalizeModelStates(auth);
       this.auths.set(auth.id, auth);
+      this.credentialVersions.set(auth.id, 1);
     }
     this.refreshLoop?.rebuild();
   }
@@ -591,6 +696,7 @@ export class AuthManager {
       if (!this.executors.has(providerKey)) continue;
       if (modelKey !== "" && !this.authSupportsRouteModel(candidate, model)) continue;
       if (tried.has(candidate.id)) continue;
+      if (this.hasPendingRejectedToken(candidate)) continue;
       candidates.push(candidate);
     }
     if (candidates.length === 0) throw newAuthNotFoundError();
@@ -599,6 +705,19 @@ export class AuthManager {
     const executor = this.executors.get(providerKey);
     if (!executor) throw new AuthManagerError("executor_not_found", "executor not registered");
     return { auth: cloneAuth(selected), executor, provider: providerKey };
+  }
+
+  /** The credential's current token was rejected with 401 and its refresh is still running (Go: issue #6415). */
+  private hasPendingRejectedToken(auth: Auth): boolean {
+    const rejected = this.pendingRejectedTokens.get(auth.id);
+    return rejected !== undefined && rejected !== "" && rejected === authAccessToken(auth);
+  }
+
+  /** Whether the auth can be selected for `model` right now, including a pending 401 refresh (Go: isAuthBlockedForModel). */
+  isSelectable(id: string, model: string): boolean {
+    const auth = this.auths.get((id ?? "").trim());
+    if (!auth || this.hasPendingRejectedToken(auth)) return false;
+    return !isAuthBlockedForModel(auth, model, this.now()).blocked;
   }
 
   // -------------------------------------------------------------------------
@@ -761,7 +880,8 @@ export class AuthManager {
   // Execution
   // -------------------------------------------------------------------------
 
-  private nextExecutionSeq(): number {
+  /** Issues the next dispatch sequence (Go: nextExecutionSeq). */
+  nextExecutionSeq(): number {
     this.executionSeq += 1;
     return this.executionSeq;
   }
@@ -797,14 +917,14 @@ export class AuthManager {
   /** Non-streaming execution with failover and retry rounds (Go: Execute). */
   execute(providers: string[], req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
     return this.runRounds(providers, req, opts, (round, attempt, snapshot) =>
-      this.executeOnce(normalizeProviders(providers), req, opts, snapshot.maxRetryCredentials, attempt, snapshot.requestRetry, round, (executor, auth) => executor.execute(auth, req, opts)),
+      this.executeOnce(normalizeProviders(providers), req, opts, snapshot.maxRetryCredentials, attempt, snapshot.requestRetry, round, (executor, auth, execReq) => executor.execute(auth, execReq, opts)),
     );
   }
 
   /** Token counting with the same selection and failover rules (Go: ExecuteCount). */
   executeCount(providers: string[], req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
     return this.runRounds(providers, req, opts, (round, attempt, snapshot) =>
-      this.executeOnce(normalizeProviders(providers), req, opts, snapshot.maxRetryCredentials, attempt, snapshot.requestRetry, round, (executor, auth) => executor.countTokens(auth, req, opts)),
+      this.executeOnce(normalizeProviders(providers), req, opts, snapshot.maxRetryCredentials, attempt, snapshot.requestRetry, round, (executor, auth, execReq) => executor.countTokens(auth, execReq, opts)),
     );
   }
 
@@ -832,7 +952,7 @@ export class AuthManager {
     retryRound: number,
     defaultRequestRetry: number,
     round: RoundState,
-    invoke: (executor: ProviderExecutor, auth: Auth) => Promise<ExecResponse>,
+    invoke: (executor: ProviderExecutor, auth: Auth, req: ExecRequest) => Promise<ExecResponse>,
   ): Promise<ExecResponse> {
     const routeModel = authSelectionModelFromOptions(opts, req.model);
     this.prepareOptions(opts, routeModel);
@@ -856,50 +976,103 @@ export class AuthManager {
       tried.add(auth.id);
       round.attempted.add(auth.id);
       const resultModel = canonicalModelKey(routeModel);
-      let executionSeq = this.nextExecutionSeq();
+      let stamp = this.dispatchStamp(auth);
       let errExec: unknown;
       let resp: ExecResponse | undefined;
       try {
-        resp = await invoke(executor, auth);
+        resp = await invoke(executor, auth, this.prepareExecutionRequest(req, auth, routeModel));
       } catch (err) {
         errExec = err;
       }
       if (errExec !== undefined) {
         round.upstreamErr = errExec;
-        if (isAbortError(errExec) || opts.signal?.aborted) throw errExec;
-        const refreshed = await this.tryRefreshAfterUnauthorized(auth, errExec, false);
-        if (refreshed) {
-          auth = refreshed;
-          notifySelectedAuth(opts, auth.id);
-          executionSeq = this.nextExecutionSeq();
-          errExec = undefined;
-          try {
-            resp = await invoke(executor, auth);
-          } catch (err) {
-            errExec = err;
-            round.upstreamErr = err;
-            if (isAbortError(err) || opts.signal?.aborted) throw err;
+        if (isAbortError(errExec)) throw errExec;
+        if (!opts.signal?.aborted) {
+          const refreshed = await this.tryRefreshAfterUnauthorized(auth, errExec, false, opts.signal);
+          if (refreshed) {
+            auth = refreshed;
+            notifySelectedAuth(opts, auth.id);
+            stamp = this.dispatchStamp(auth);
+            errExec = undefined;
+            try {
+              resp = await invoke(executor, auth, this.prepareExecutionRequest(req, auth, routeModel));
+            } catch (err) {
+              errExec = err;
+              round.upstreamErr = err;
+              if (isAbortError(err)) throw err;
+            }
           }
         }
       }
       if (errExec === undefined) {
-        this.markResult({ authId: auth.id, provider, model: resultModel, routeModel, success: true, executionSeq });
+        this.markResult({ authId: auth.id, provider, model: resultModel, routeModel, success: true, ...stamp });
         return resp!;
       }
-      this.markResult({
-        authId: auth.id,
-        provider,
-        model: resultModel,
-        routeModel,
-        success: false,
-        error: resultErrorFromError(errExec),
-        retryAfterMs: retryAfterFromError(errExec),
-        credentialScope: isCredentialScopedError(errExec),
-        executionSeq,
-      });
+      this.markFailure(auth.id, provider, resultModel, routeModel, errExec, stamp);
+      // The upstream failure is recorded even when the client went away (Go: issue #6503).
+      if (opts.signal?.aborted) throw abortReason(opts.signal);
       if (isRequestInvalidError(errExec)) throw errExec;
       lastErr = errExec;
     }
+  }
+
+  private markFailure(authId: string, provider: string, model: string, routeModel: string, err: unknown, stamp: DispatchStamp): void {
+    this.markResult({
+      authId,
+      provider,
+      model,
+      routeModel,
+      success: false,
+      error: resultErrorFromError(err),
+      retryAfterMs: retryAfterFromError(err),
+      credentialScope: isCredentialScopedError(err),
+      ...stamp,
+    });
+  }
+
+  /** Sequence, credential version and token captured when an execution is dispatched. */
+  private dispatchStamp(auth: Auth): DispatchStamp {
+    return { executionSeq: this.nextExecutionSeq(), credentialVersion: this.credentialVersion(auth.id), accessToken: authAccessToken(auth) };
+  }
+
+  /**
+   * The request the executor receives for this credential: routing prefix
+   * stripped, API-key alias resolved (suffix preserved) and the configured
+   * model definition bound to the metadata (Go: executionModelCandidatesWithAlias
+   * + attachResolvedAPIKeyModelInfo).
+   */
+  prepareExecutionRequest(req: ExecRequest, auth: Auth, routeModel: string): ExecRequest {
+    const upstreamModel = resolveExecutionModel(this.config, auth, routeModel || req.model);
+    let execReq: ExecRequest = upstreamModel !== "" && upstreamModel !== req.model ? { ...req, model: upstreamModel } : req;
+    execReq = attachResolvedAPIKeyModelInfo(this.config, execReq, auth, routeModel || req.model, execReq.model);
+    return execReq;
+  }
+
+  /** The upstream model this credential serves for `routeModel` (Go: ResolveExecutionModel). */
+  resolveExecutionModel(auth: Auth, routeModel: string): string {
+    return resolveExecutionModel(this.config, auth, routeModel);
+  }
+
+  /** Alias table lookup for a registered API-key credential; "" when unknown (Go: lookupAPIKeyUpstreamModel). */
+  lookupAPIKeyUpstreamModel(authId: string, requestedModel: string): string {
+    const auth = this.auths.get((authId ?? "").trim());
+    if (!auth || (requestedModel ?? "").trim() === "") return "";
+    return lookupAPIKeyUpstreamModel(compileAPIKeyModelAlias(configuredModelOverrides(this.config, auth)), requestedModel);
+  }
+
+  /** Alias resolution with force-mapping details (Go: resolveAPIKeyModelAliasWithResult). */
+  resolveAPIKeyModelAliasWithResult(auth: Auth, requestedModel: string): ModelAliasResult {
+    return resolveAPIKeyModelAliasWithResult(this.config, auth, requestedModel);
+  }
+
+  /** Binds the configured model definition for `auth` to the request (Go: attachResolvedAPIKeyModelInfo). */
+  attachResolvedAPIKeyModelInfo(req: ExecRequest, auth: Auth, routeModel: string, upstreamModel: string): ExecRequest {
+    return attachResolvedAPIKeyModelInfo(this.config, req, auth, routeModel, upstreamModel);
+  }
+
+  /** Current credential version (Go: Auth.CredentialVersion); 0 for unknown ids. */
+  credentialVersion(id: string): number {
+    return this.credentialVersions.get((id ?? "").trim()) ?? 0;
   }
 
   private async startStream(executor: ProviderExecutor, auth: Auth, req: ExecRequest, opts: ExecOptions) {
@@ -930,68 +1103,52 @@ export class AuthManager {
       tried.add(auth.id);
       round.attempted.add(auth.id);
       const resultModel = canonicalModelKey(routeModel);
-      let executionSeq = this.nextExecutionSeq();
+      let stamp = this.dispatchStamp(auth);
       let errStream: unknown;
       let started: Awaited<ReturnType<typeof readStreamBootstrap>> | undefined;
       try {
-        started = await this.startStream(executor, auth, req, opts);
+        started = await this.startStream(executor, auth, this.prepareExecutionRequest(req, auth, routeModel), opts);
       } catch (err) {
         errStream = err;
       }
       if (errStream !== undefined) {
         round.upstreamErr = errStream;
         const cause = unwrapStreamBootstrapError(errStream);
-        if (isAbortError(cause) || opts.signal?.aborted) throw cause;
-        const refreshed = await this.tryRefreshAfterUnauthorized(auth, cause, false);
-        if (refreshed) {
-          auth = refreshed;
-          notifySelectedAuth(opts, auth.id);
-          executionSeq = this.nextExecutionSeq();
-          errStream = undefined;
-          try {
-            started = await this.startStream(executor, auth, req, opts);
-          } catch (err) {
-            errStream = err;
-            round.upstreamErr = err;
-            if (isAbortError(unwrapStreamBootstrapError(err)) || opts.signal?.aborted) throw unwrapStreamBootstrapError(err);
+        if (isAbortError(cause)) throw cause;
+        if (!opts.signal?.aborted) {
+          const refreshed = await this.tryRefreshAfterUnauthorized(auth, cause, false, opts.signal);
+          if (refreshed) {
+            auth = refreshed;
+            notifySelectedAuth(opts, auth.id);
+            stamp = this.dispatchStamp(auth);
+            errStream = undefined;
+            try {
+              started = await this.startStream(executor, auth, this.prepareExecutionRequest(req, auth, routeModel), opts);
+            } catch (err) {
+              errStream = err;
+              round.upstreamErr = err;
+              if (isAbortError(unwrapStreamBootstrapError(err))) throw unwrapStreamBootstrapError(err);
+            }
           }
         }
       }
       if (errStream !== undefined) {
         const cause = unwrapStreamBootstrapError(errStream);
-        this.markResult({
-          authId: auth.id,
-          provider,
-          model: resultModel,
-          routeModel,
-          success: false,
-          error: resultErrorFromError(cause),
-          retryAfterMs: retryAfterFromError(cause),
-          credentialScope: isCredentialScopedError(cause),
-          executionSeq,
-        });
+        this.markFailure(auth.id, provider, resultModel, routeModel, cause, stamp);
+        // The upstream failure is recorded even when the client went away (Go: issue #6503).
+        if (opts.signal?.aborted) throw abortReason(opts.signal);
         if (isRequestInvalidError(cause)) throw cause;
         lastErr = errStream;
         continue;
       }
       const committedAuth = auth;
-      const committedSeq = executionSeq;
+      const committedStamp = stamp;
       return wrapStreamResult(started!, (err) => {
         if (err === undefined) {
-          this.markResult({ authId: committedAuth.id, provider, model: resultModel, routeModel, success: true, executionSeq: committedSeq });
+          this.markResult({ authId: committedAuth.id, provider, model: resultModel, routeModel, success: true, ...committedStamp });
           return;
         }
-        this.markResult({
-          authId: committedAuth.id,
-          provider,
-          model: resultModel,
-          routeModel,
-          success: false,
-          error: resultErrorFromError(err),
-          retryAfterMs: retryAfterFromError(err),
-          credentialScope: isCredentialScopedError(err),
-          executionSeq: committedSeq,
-        });
+        this.markFailure(committedAuth.id, provider, resultModel, routeModel, err, committedStamp);
       });
     }
   }
@@ -1018,6 +1175,7 @@ export class AuthManager {
     if (!result || !result.authId) return;
     const auth = this.auths.get(result.authId);
     if (!auth) return;
+    if (this.isStaleExecutionResult(result, auth)) return;
     const now = this.now();
     let modelKey = canonicalModelKey(result.model ?? "");
     if (modelKey === "" && result.routeModel) modelKey = canonicalModelKey(result.routeModel);
@@ -1105,6 +1263,18 @@ export class AuthManager {
     if (scheduleUnauthorizedRefresh) this.refreshLoop?.reschedule(auth.id);
   }
 
+  /**
+   * A result from a superseded credential version: it must not cool or
+   * invalidate the replacement, unless it ran with the current access token
+   * (Go: isStaleExecutionResult, without registration epochs).
+   */
+  private isStaleExecutionResult(result: ExecutionResult, current: Auth): boolean {
+    if (result.accessToken && result.accessToken === authAccessToken(current)) return false;
+    const resultVersion = result.credentialVersion ?? 0;
+    const currentVersion = this.credentialVersions.get(current.id) ?? 0;
+    return resultVersion < currentVersion && (resultVersion > 0 || currentVersion > 1);
+  }
+
   /** Clears every cooldown of the credential and resumes its registry models (Go: ResetQuota). */
   resetQuota(id: string): { auth: Auth; models: string[] } | undefined {
     const auth = this.auths.get((id ?? "").trim());
@@ -1146,18 +1316,25 @@ export class AuthManager {
    * After a 401, refreshes the credential once and returns the refreshed auth
    * for an in-place retry; undefined means fail over (Go: tryRefreshAfterUnauthorized).
    */
-  private async tryRefreshAfterUnauthorized(auth: Auth, err: unknown, alreadyTried: boolean): Promise<Auth | undefined> {
+  private async tryRefreshAfterUnauthorized(auth: Auth, err: unknown, alreadyTried: boolean, signal?: AbortSignal): Promise<Auth | undefined> {
     if (isRequestScopedError(err) || !isUnauthorizedError(err)) return undefined;
     const failedToken = authAccessToken(auth);
     const current = this.auths.get(auth.id);
     if (alreadyTried || !authHasRefreshCredential(auth) || hasUnauthorizedAuthFailure(current ?? auth)) return undefined;
     log.debug(`unauthorized response for ${auth.provider} (${auth.id}), refreshing credentials before fallback`);
+    // Concurrent requests must not pick the rejected token while its refresh runs (Go: issue #6415).
+    const markRejected = failedToken !== "" && authAccessToken(current) === failedToken;
+    if (markRejected) this.pendingRejectedTokens.set(auth.id, failedToken);
     let refreshed: Auth;
     try {
       refreshed = await this.refreshAuth(auth.id, { failedAccessToken: failedToken });
     } catch (refreshErr) {
+      // A canceled request stops here: no cooldown, no fallback (Go: claudeOAuthRequestCancellation / refresh cancellation).
+      if (isAbortError(refreshErr) || signal?.aborted) throw signal?.aborted ? abortReason(signal) : refreshErr;
       log.debug(`credential refresh before fallback failed for ${auth.provider} (${auth.id}):`, refreshErr instanceof Error ? refreshErr.message : String(refreshErr));
       return undefined;
+    } finally {
+      if (markRejected && this.pendingRejectedTokens.get(auth.id) === failedToken) this.pendingRejectedTokens.delete(auth.id);
     }
     if (failedToken !== "" && authAccessToken(refreshed) === failedToken) return undefined;
     return refreshed;
@@ -1203,9 +1380,21 @@ export class AuthManager {
     const now = this.now();
     const live = this.auths.get(id);
     if (!live) throw new AuthManagerError("auth_not_found", `auth ${id} not found`);
+    if (refreshErr !== undefined && isAbortError(refreshErr)) {
+      // A canceled refresh records no failure; it is retried shortly (Go: refreshAuthForRequest, context.Canceled).
+      log.debug(`refresh canceled for ${live.provider}, ${live.id}`);
+      if (live.nextRefreshAfter === 0 || live.nextRefreshAfter < now) live.nextRefreshAfter = now + 1000;
+      this.refreshLoop?.reschedule(id);
+      throw refreshErr;
+    }
     if (refreshErr !== undefined) {
       this.applyRefreshFailure(live, refreshErr, failedToken, force, now);
       throw refreshErr;
+    }
+    // Credentials committed while the refresh ran win over its result (Go: issue #6417).
+    if (credentialsChanged(base, live)) {
+      log.debug(`discarding stale refresh result for ${live.provider}, ${live.id}: credentials changed concurrently`);
+      return cloneAuth(live);
     }
     const next = updated ? cloneAuth(updated) : cloneAuth(base);
     if (next.runtime === undefined) next.runtime = live.runtime;
@@ -1235,6 +1424,7 @@ export class AuthManager {
     if (shouldRefresh(next, now, this.refreshLead)) next.nextRefreshAfter = now + RefreshIneffectiveBackoffMs;
     next.updatedAt = now;
     normalizeModelStates(next);
+    if (credentialsChanged(live, next)) this.credentialVersions.set(id, (this.credentialVersions.get(id) ?? 1) + 1);
     this.auths.set(id, next);
     this.persist(next);
     this.syncRegistryProjections(next);

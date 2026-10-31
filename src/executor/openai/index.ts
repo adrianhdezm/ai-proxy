@@ -26,7 +26,6 @@ import { modelOverridesFor } from "../../config/auths.ts";
 import { type Auth, AttributeAPIKey, AttributeBaseURL } from "../../auth/types.ts";
 import { FormatClaude, FormatOpenAI, FormatOpenAIResponse, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
 import { hasRequestTransformer, translateNonStream, translateRequest, translateTokenCount } from "../../translator/registry.ts";
-import { convertClaudeRequestToOpenAIWithCompat } from "../../translator/openai/claude/index.ts";
 import "../../translator/openai/openai/responses/index.ts";
 import { applyPatchTranslationError, applyPatchUpstreamError, canFinalizeResponseStream, ensureResponsesUsageDetails, finalizeApplyPatchStream, initializeApplyPatchStream } from "../responses.ts";
 import {
@@ -46,6 +45,9 @@ import { SSEParser, type SSEEvent } from "../../util/sse.ts";
 import { getAt, gstr, isArr, isObj } from "../../util/gpath.ts";
 import { tryParse } from "../../util/json.ts";
 import { log } from "../../log.ts";
+import { applyFetchProxy } from "../proxy.ts";
+import { translateRequestPairWithAPIKeyModelCompatibility, translateRequestWithAPIKeyModelCompatibility } from "../request_pair.ts";
+import { type ResponseModelReporter, newResponseModelReporter, publishResponseModelAfter } from "../response_model.ts";
 import {
   type ExecOptions,
   type ExecRequest,
@@ -196,23 +198,6 @@ function asRequestError(err: unknown): unknown {
   return err;
 }
 
-/**
- * Translates one payload Claude -> OpenAI, using the compat converter when the
- * model asks for it (Go: TranslateRequestWithAPIKeyModelCompatibility for the
- * claude/openai pair; other pairs go through the registry).
- */
-function translateRequestWithAPIKeyModelCompatibility(from: Format, to: Format, model: string, payload: string, stream: boolean, isCompat: boolean): string {
-  if (isCompat && from === FormatClaude && to === FormatOpenAI) return convertClaudeRequestToOpenAIWithCompat(model, payload, stream);
-  return translateRequest(from, to, model, payload, stream);
-}
-
-/** Go: TranslateRequestPairWithAPIKeyModelCompatibility (one translation when both payloads are identical). */
-function translateRequestPairWithAPIKeyModelCompatibility(from: Format, to: Format, model: string, originalPayload: string, requestPayload: string, stream: boolean, isCompat: boolean): { original: string; working: string } {
-  const original = translateRequestWithAPIKeyModelCompatibility(from, to, model, originalPayload, stream, isCompat);
-  if (originalPayload === requestPayload) return { original, working: original };
-  return { original, working: translateRequestWithAPIKeyModelCompatibility(from, to, model, requestPayload, stream, isCompat) };
-}
-
 interface PreparedRequest {
   url: string;
   headers: Headers;
@@ -292,8 +277,7 @@ export class OpenAICompatExecutor implements ProviderExecutor {
 
   private async send(auth: Auth, prepared: PreparedRequest, opts: ExecOptions): Promise<Response> {
     const init: RequestInit & { proxy?: string } = { method: "POST", headers: prepared.headers, body: prepared.body, signal: opts.signal };
-    const proxy = (opts.proxyUrl ?? auth.proxyUrl ?? this.cfg?.requests.proxyUrl ?? "").trim();
-    if (proxy !== "") init.proxy = proxy;
+    applyFetchProxy(init, opts.proxyUrl, auth.proxyUrl, this.cfg?.requests.proxyUrl);
     return this.fetchFn(prepared.url, init);
   }
 
@@ -312,6 +296,9 @@ export class OpenAICompatExecutor implements ProviderExecutor {
       log.debug("openai compat executor: request error", { status: resp.status });
       throw newOpenAICompatStatusError(resp.status, resp.headers, body, this.now());
     }
+    const reporter = newResponseModelReporter(this.identifier, req.model, auth);
+    reporter.observeResponseModel(body);
+    reporter.publish();
     const state: TranslatorState = {};
     const ctx: TranslateContext = { signal: opts.signal };
     let out = translateNonStream(ctx, FormatOpenAI, prepared.responseFormat, req.model, prepared.originalPayload, prepared.body, body, state);
@@ -333,11 +320,12 @@ export class OpenAICompatExecutor implements ProviderExecutor {
       throw newOpenAICompatStatusError(resp.status, resp.headers, body, this.now());
     }
     const inputTokens = newClaudeInputTokenState(prepared.from, FormatOpenAI, prepared.responseFormat, prepared.originalPayload);
-    return { headers: resp.headers, chunks: this.streamChunks(resp, req, opts, prepared, inputTokens) };
+    const reporter = newResponseModelReporter(this.identifier, req.model, auth);
+    return { headers: resp.headers, chunks: publishResponseModelAfter(this.streamChunks(resp, req, opts, prepared, inputTokens, reporter), reporter) };
   }
 
   /** Reads the upstream SSE body frame by frame and yields translated downstream frames. */
-  private async *streamChunks(resp: Response, req: ExecRequest, opts: ExecOptions, prepared: PreparedRequest, inputTokens: ClaudeInputTokenState): AsyncGenerator<string> {
+  private async *streamChunks(resp: Response, req: ExecRequest, opts: ExecOptions, prepared: PreparedRequest, inputTokens: ClaudeInputTokenState, reporter?: ResponseModelReporter): AsyncGenerator<string> {
     const state: TranslatorState = {};
     const ctx: TranslateContext = { signal: opts.signal };
     const responseFormat = prepared.responseFormat;
@@ -377,6 +365,7 @@ export class OpenAICompatExecutor implements ProviderExecutor {
       if (!isDone) {
         const streamErr = openAICompatStreamDataError(dataPayload, eventName);
         if (streamErr) throw streamErr;
+        reporter?.observeResponseModel(dataPayload);
         if (!sawFinishReason && openAICompatChunkHasFinishReason(dataPayload)) sawFinishReason = true;
       }
       const chunks = translate("data: " + dataPayload);

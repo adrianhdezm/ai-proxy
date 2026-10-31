@@ -18,6 +18,19 @@ function lowerTrim(v: string): string {
 }
 
 /**
+ * A window status header. Fetch joins repeated (or differently cased) entries
+ * with ", "; any "rejected" value wins, otherwise the first non-empty one.
+ */
+function statusHeader(h: Headers, name: string): string {
+  const values = header(h, name)
+    .split(",")
+    .map(lowerTrim)
+    .filter((v) => v !== "");
+  if (values.includes("rejected")) return "rejected";
+  return values[0] ?? "";
+}
+
+/**
  * Whether response headers explicitly declare an Anthropic shared 5h or 7d
  * rate-limit rejection (Go: ClaudeHeadersIndicateUnifiedRateLimitRejection). An
  * overage-only or Fable-only rejection remains model-scoped when the shared
@@ -25,13 +38,13 @@ function lowerTrim(v: string): string {
  */
 export function claudeHeadersIndicateUnifiedRateLimitRejection(headers: Headers | undefined): boolean {
   if (!headers) return false;
-  const unifiedStatus = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-Status"));
-  const status5h = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-5h-Status"));
+  const unifiedStatus = statusHeader(headers, "Anthropic-Ratelimit-Unified-Status");
+  const status5h = statusHeader(headers, "Anthropic-Ratelimit-Unified-5h-Status");
   if (status5h === "rejected") return true;
-  const status7d = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-7d-Status"));
+  const status7d = statusHeader(headers, "Anthropic-Ratelimit-Unified-7d-Status");
   if (status7d === "rejected") return true;
   if (unifiedStatus !== "rejected") return false;
-  const status7dOI = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status"));
+  const status7dOI = statusHeader(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status");
   return !isOverageOrFableOnlyRejection(headers, unifiedStatus, status5h, status7d, status7dOI);
 }
 
@@ -42,7 +55,7 @@ function isClaudeWindowAllowed(status: string): boolean {
 function isOverageOrFableOnlyRejection(headers: Headers, unifiedStatus: string, status5h: string, status7d: string, status7dOI: string): boolean {
   if (status5h === "rejected" || status7d === "rejected") return false;
 
-  const overageStatus = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-Overage-Status"));
+  const overageStatus = statusHeader(headers, "Anthropic-Ratelimit-Unified-Overage-Status");
   const overageDisabledReason = header(headers, "Anthropic-Ratelimit-Unified-Overage-Disabled-Reason").trim();
   const representativeClaim = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-Representative-Claim"));
 
@@ -128,11 +141,17 @@ function claudeHeadersHaveQuotaStatus(headers: Headers): boolean {
   return false;
 }
 
-/** The sole value of a header; a repeated header (joined with ", " by Headers) is ambiguous. */
+/** An IMF-fixdate (RFC 9110), the one HTTP-date form that itself contains a comma. */
+const httpDatePattern = /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * The sole value of a header; a repeated header (joined with ", " by Headers) is
+ * ambiguous. A single HTTP-date keeps its own comma.
+ */
 function singleHeaderValue(headers: Headers, name: string): string | undefined {
   const value = headers.get(name);
   if (value === null) return undefined;
-  if (value.includes(",")) return undefined;
+  if (value.includes(",") && !httpDatePattern.test(value.trim())) return undefined;
   return value;
 }
 
@@ -144,10 +163,10 @@ export function parseClaudeRateLimitReset(headers: Headers | undefined, nowMs: n
 export function parseClaudeRateLimitResetWithFuzz(headers: Headers | undefined, nowMs: number, minFuzzSec: number, maxFuzzSec: number): number | undefined {
   if (!headers) return undefined;
 
-  const unifiedStatus = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-Status"));
-  const status5h = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-5h-Status"));
-  const status7d = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-7d-Status"));
-  const status7dOI = lowerTrim(header(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status"));
+  const unifiedStatus = statusHeader(headers, "Anthropic-Ratelimit-Unified-Status");
+  const status5h = statusHeader(headers, "Anthropic-Ratelimit-Unified-5h-Status");
+  const status7d = statusHeader(headers, "Anthropic-Ratelimit-Unified-7d-Status");
+  const status7dOI = statusHeader(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status");
   const overageOnlyRejection = isOverageOrFableOnlyRejection(headers, unifiedStatus, status5h, status7d, status7dOI);
 
   const candidates: number[] = [];

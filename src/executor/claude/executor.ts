@@ -18,8 +18,11 @@
 // per request), the web search result cache (client.codex.web-search-result-cache),
 // apply_patch stream finalisation and EnsureResponsesUsageDetails.
 //
-// Skipped from upstream (see the slice report): MCP alias remapping,
-// compaction, fast-mode error wrappers,
+// Cloaked OAuth / claude-code-cli requests present client tools as Claude Code
+// MCP aliases (tool_alias.ts) and restore the names in responses. Fast-mode
+// requests to api.anthropic.com fail request-scoped (fast_error.ts).
+//
+// Skipped from upstream (see the slice report): compaction,
 // usage reporting plugins, payload config rules, preserved-thinking block
 // binding, local token estimation and the OAuth profile prefetch.
 import { ClaudeAuthenticator } from "../../auth/claude/authenticator.ts";
@@ -47,11 +50,23 @@ import {
   restoreClaudeWebSearchResults,
 } from "./web_search_results.ts";
 import { claudeModelLacksToolSearch } from "./tool_search.ts";
+import { claudeRequestIsFast, newClaudeFastDirectResponseError, wrapClaudeFastRequestError, wrapClaudeFastStreamErrors } from "./fast_error.ts";
+import {
+  ClaudeOAuthToolAliasStore,
+  type ClaudeToolAliasMap,
+  prepareClaudeOAuthToolNamesForRequest,
+  rememberClaudeOAuthToolAliases,
+  remapOAuthToolNames,
+  resolveClaudeMCPAliasSecret,
+  reverseRemapOAuthToolNames,
+  reverseRemapOAuthToolNamesInSSE,
+} from "./tool_alias.ts";
 import { stripClaudeCodeAttributionSystem } from "../../util/claude_attribution.ts";
 import { getAt, gint, isObj } from "../../util/gpath.ts";
 import { tryParse } from "../../util/json.ts";
 import { iterateSSE } from "../../util/sse.ts";
 import { type ExecOptions, type ExecRequest, type ExecResponse, type ProviderExecutor, StatusError, type StreamResult, responseFormatOrSource } from "../types.ts";
+import { applyFetchProxy } from "../proxy.ts";
 import { extractAndRemoveBetas, claudeTokenCountingBeta } from "./betas.ts";
 import {
   claudeCacheControlTTL1h,
@@ -120,7 +135,7 @@ import {
   restoreClaudeResponseModel,
   validateClaudeStreamingResponse,
 } from "./response.ts";
-import { DefaultClaudeBaseURL, claudeCreds, headerValueCaseInsensitive, isAnthropicUpstreamBase } from "./upstream.ts";
+import { DefaultClaudeBaseURL, claudeCreds, headerValueCaseInsensitive, isAnthropicUpstreamBase, isAnthropicUpstreamURL } from "./upstream.ts";
 import { defaultClaudeVersion } from "./device_profile.ts";
 
 export type FetchLike = (input: string, init?: RequestInit & { proxy?: string; decompress?: boolean }) => Promise<Response>;
@@ -163,6 +178,8 @@ export interface ClaudeExecutorConfig {
   webSearchResultCache?: ClaudeWebSearchResultCacheConfig;
   /** Web search result store; defaults to the process-wide cache (or a private one when `now` is set). */
   webSearchResultStore?: ClaudeWebSearchResultCache;
+  /** Thread-continuation MCP alias store; defaults to one per executor. */
+  toolAliasStore?: ClaudeOAuthToolAliasStore;
 }
 
 /** What applyNativeToolSearchFallback decided for one request. */
@@ -183,6 +200,7 @@ export class ClaudeExecutor implements ProviderExecutor {
   readonly continuity: ClaudeContinuityStore;
   readonly replayCache: ClaudeThinkingReplayCache;
   readonly webSearchResults: ClaudeWebSearchResultCache;
+  readonly toolAliases: ClaudeOAuthToolAliasStore;
 
   constructor(cfg: ClaudeExecutorConfig = {}) {
     this.cfg = cfg;
@@ -191,6 +209,7 @@ export class ClaudeExecutor implements ProviderExecutor {
     this.continuity = cfg.continuityStore ?? (cfg.now ? new ClaudeContinuityStore(cfg.now) : defaultClaudeContinuityStore);
     this.replayCache = cfg.thinkingReplayCache ?? (cfg.now ? new ClaudeThinkingReplayCache({ now: cfg.now }) : defaultClaudeThinkingReplayCache);
     this.webSearchResults = cfg.webSearchResultStore ?? (cfg.now ? new ClaudeWebSearchResultCache({ now: cfg.now }) : defaultClaudeWebSearchResultCache);
+    this.toolAliases = cfg.toolAliasStore ?? new ClaudeOAuthToolAliasStore();
   }
 
   /**
@@ -253,6 +272,12 @@ export class ClaudeExecutor implements ProviderExecutor {
     if (scope.replayApplied && shouldClearThinkingReplayAfterError(err)) clearClaudeThinkingReplayContent(this.replayCache, scope);
   }
 
+  /** The credential attribute rebuild_mid_system_message or the executor-wide switch (Go: rebuildMidSystemMessageEnabled). */
+  private rebuildMidSystemMessageEnabled(auth: Auth): boolean {
+    if ((auth.attributes?.rebuild_mid_system_message ?? "").trim().toLowerCase() === "true") return true;
+    return this.cfg.rebuildMidSystemMessage === true;
+  }
+
   private modelLevelCooling(): boolean {
     return this.cfg.modelLevelCooling === true;
   }
@@ -267,24 +292,37 @@ export class ClaudeExecutor implements ProviderExecutor {
   }
 
   private async send(url: string, headers: Headers, body: string, auth: Auth, opts: ExecOptions): Promise<Response> {
-    const proxy = opts.proxyUrl ?? auth.proxyUrl ?? this.cfg.proxyUrl;
     const init: RequestInit & { proxy?: string; decompress?: boolean } = { method: "POST", headers, body, signal: opts.signal, decompress: false };
-    if (proxy) init.proxy = proxy;
+    applyFetchProxy(init, opts.proxyUrl, auth.proxyUrl, this.cfg.proxyUrl);
     return this.fetchImpl(url, init);
   }
 
-  /** Reads and classifies a non-2xx upstream response. */
-  private async upstreamError(res: Response): Promise<StatusError> {
+  /**
+   * Reads and classifies a non-2xx upstream response. A fast request's error is
+   * passed through request-scoped instead (Go: newClaudeFastDirectResponseError).
+   */
+  private async upstreamError(res: Response, fastRequest = false): Promise<unknown> {
     let text: string;
     try {
       text = await readAllText(decodeResponseBody(res.body, claudeResponseContentEncoding(res.headers)));
     } catch (err) {
       const msg = `failed to decode error response body: ${(err as Error).message}`;
       log.warn(msg);
-      return classifyClaudeUpstreamErrorWithCooling(res.status, res.headers, msg, this.modelLevelCooling(), this.now());
+      const classified = classifyClaudeUpstreamErrorWithCooling(res.status, res.headers, msg, this.modelLevelCooling(), this.now());
+      return wrapClaudeFastRequestError(fastRequest, res.status, classified);
     }
     log.debug("claude executor: request error", { status: res.status });
+    if (fastRequest) return newClaudeFastDirectResponseError(res.status, res.headers, text, this.now());
     return classifyClaudeUpstreamErrorWithCooling(res.status, res.headers, text, this.modelLevelCooling(), this.now());
+  }
+
+  /** Sends a prepared request; a fast request's transport failure is request-scoped (Go: wrapClaudeFastRequestError). */
+  private async sendPrepared(prepared: { url: string; headers: Headers; body: string }, auth: Auth, opts: ExecOptions, fastRequest: boolean): Promise<Response> {
+    try {
+      return await this.send(prepared.url, prepared.headers, prepared.body, auth, opts);
+    } catch (err) {
+      throw wrapClaudeFastRequestError(fastRequest, 0, err);
+    }
   }
 
   /**
@@ -297,7 +335,16 @@ export class ClaudeExecutor implements ProviderExecutor {
     opts: ExecOptions,
     upstreamStream: boolean,
     toolSearch: boolean,
-  ): { url: string; headers: Headers; body: string; bodyForTranslation: string; originalPayload: string; diagnostics: ClaudeDiagnosticsRequestState; webSearch: ClaudeWebSearchResultScope } {
+  ): {
+    url: string;
+    headers: Headers;
+    body: string;
+    bodyForTranslation: string;
+    originalPayload: string;
+    diagnostics: ClaudeDiagnosticsRequestState;
+    webSearch: ClaudeWebSearchResultScope;
+    toolAliases?: ClaudeToolAliasMap;
+  } {
     const baseModel = parseSuffix(req.model).modelName;
     const upstreamModel = this.upstreamModel(baseModel);
     const { apiKey, baseURL: configuredBase } = claudeCreds(auth);
@@ -335,7 +382,7 @@ export class ClaudeExecutor implements ProviderExecutor {
     body = applyRequestThinking(body, req, opts, from, to, this.identifier);
     const webSearch = this.webSearchScope(auth, req, opts, originalPayload);
     body = restoreClaudeWebSearchResults(this.webSearchResults, webSearch, body);
-    if (this.cfg.rebuildMidSystemMessage) body = rebuildMidSystemMessagesToTopLevel(body);
+    if (this.rebuildMidSystemMessageEnabled(auth)) body = rebuildMidSystemMessagesToTopLevel(body);
 
     let isProbeOrHelper = isClaudeProbeOrHelperRequest(body);
     const explicitCacheMode = isExplicitPromptCacheMode(originalPayload, req.payload, body);
@@ -395,7 +442,15 @@ export class ClaudeExecutor implements ProviderExecutor {
     body = setBoolIfDifferent(body, "stream", upstreamStream);
 
     const bodyForTranslation = body;
-    let bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(body, baseModel, apiKeyModelIsCompat(req));
+    let bodyForUpstream = body;
+    // Cloaked Claude Code traffic carries its client tools as MCP extensions.
+    let toolAliases: ClaudeToolAliasMap | undefined;
+    if (fp.profileClaudeCodeCLI && cloaked) {
+      const aliased = prepareClaudeOAuthToolNamesForRequest(this.toolAliases, bodyForUpstream, resolveClaudeMCPAliasSecret(opts.metadata, req.metadata));
+      bodyForUpstream = aliased.body;
+      toolAliases = aliased.reverseMap;
+    }
+    bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(bodyForUpstream, baseModel, apiKeyModelIsCompat(req));
     if (fp.applyCLIIdentity) bodyForUpstream = applyClaudeCLIIdentity(bodyForUpstream, auth, apiKey, sessionID, fp.synthesizeIdentity);
     if (cchSigning) {
       let cchBilling = "";
@@ -425,7 +480,7 @@ export class ClaudeExecutor implements ProviderExecutor {
       confirmedClaudeCode: confirmedClaudeCode && !cloaked,
       sessionID,
     });
-    return { url, headers, body: bodyForUpstream, bodyForTranslation, originalPayload, diagnostics, webSearch };
+    return { url, headers, body: bodyForUpstream, bodyForTranslation, originalPayload, diagnostics, webSearch, toolAliases };
   }
 
   async execute(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
@@ -447,16 +502,41 @@ export class ClaudeExecutor implements ProviderExecutor {
     // upstream event stream so the registered translator can aggregate it.
     const upstreamStream = responseFormat !== to;
     const prepared = this.prepare(auth, req, opts, upstreamStream, toolSearch);
-    const res = await this.send(prepared.url, prepared.headers, prepared.body, auth, opts);
-    if (res.status < 200 || res.status >= 300) throw await this.upstreamError(res);
-    let data = await readAllText(decodeResponseBody(res.body, claudeResponseContentEncoding(res.headers)));
+    const fastRequest = isAnthropicUpstreamURL(prepared.url) && claudeRequestIsFast(prepared.headers, prepared.body);
+    const res = await this.sendPrepared(prepared, auth, opts, fastRequest);
+    if (res.status < 200 || res.status >= 300) throw await this.upstreamError(res, fastRequest);
+    try {
+      return this.finishExecute(await readAllText(decodeResponseBody(res.body, claudeResponseContentEncoding(res.headers))), res, req, opts, prepared, upstreamStream, replayScope, toolSearch, responseFormat);
+    } catch (err) {
+      throw wrapClaudeFastRequestError(fastRequest, res.status, err);
+    }
+  }
+
+  private finishExecute(
+    data: string,
+    res: Response,
+    req: ExecRequest,
+    opts: ExecOptions,
+    prepared: ReturnType<ClaudeExecutor["prepare"]>,
+    upstreamStream: boolean,
+    replayScope: ClaudeThinkingReplayScope,
+    toolSearch: boolean,
+    responseFormat: string,
+  ): ExecResponse {
     const requestID = headerValueCaseInsensitive(res.headers, "request-id");
     if (upstreamStream) {
       validateClaudeStreamingResponse(data);
       const messageID = claudeMessageIDFromSSE(data);
-      if (messageID !== "") commitClaudeContinuity(this.continuity, prepared.diagnostics, messageID, requestID);
+      if (messageID !== "") {
+        commitClaudeContinuity(this.continuity, prepared.diagnostics, messageID, requestID);
+        rememberClaudeOAuthToolAliases(this.toolAliases, prepared.bodyForTranslation, prepared.toolAliases, messageID);
+      }
+      data = reverseRemapOAuthToolNamesInSSE(data, prepared.toolAliases);
     } else {
-      commitClaudeContinuity(this.continuity, prepared.diagnostics, claudeMessageIDFromResponse(data), requestID);
+      const messageID = claudeMessageIDFromResponse(data);
+      commitClaudeContinuity(this.continuity, prepared.diagnostics, messageID, requestID);
+      rememberClaudeOAuthToolAliases(this.toolAliases, prepared.bodyForTranslation, prepared.toolAliases, messageID);
+      data = reverseRemapOAuthToolNames(data, prepared.toolAliases);
     }
     data = this.restoreResponseModel(data, req.model);
     recordClaudeWebSearchResults(this.webSearchResults, prepared.webSearch, data);
@@ -490,24 +570,29 @@ export class ClaudeExecutor implements ProviderExecutor {
   private async executeStreamInner(auth: Auth, req: ExecRequest, opts: ExecOptions, toolSearch: boolean): Promise<StreamResult> {
     const responseFormat = responseFormatOrSource(opts);
     const prepared = this.prepare(auth, req, opts, true, toolSearch);
-    const res = await this.send(prepared.url, prepared.headers, prepared.body, auth, opts);
-    if (res.status < 200 || res.status >= 300) throw await this.upstreamError(res);
+    const fastRequest = isAnthropicUpstreamURL(prepared.url) && claudeRequestIsFast(prepared.headers, prepared.body);
+    const res = await this.sendPrepared(prepared, auth, opts, fastRequest);
+    if (res.status < 200 || res.status >= 300) throw await this.upstreamError(res, fastRequest);
     const decoded = decodeResponseBody(res.body, claudeResponseContentEncoding(res.headers));
     const webSearch = prepared.webSearch;
+    const toolAliases = prepared.toolAliases;
     const restore = (frame: string): string => {
-      const restored = this.restoreResponseModel(frame, req.model);
+      const restored = this.restoreResponseModel(reverseRemapOAuthToolNamesInSSE(frame, toolAliases), req.model);
       recordClaudeWebSearchResults(this.webSearchResults, webSearch, restored);
       return restored;
     };
     const signal = opts.signal;
     const requestID = headerValueCaseInsensitive(res.headers, "request-id");
     // Continuity advances only once the upstream stream reached message_stop.
-    const onComplete = (state: ClaudeStreamState): void => commitClaudeContinuity(this.continuity, prepared.diagnostics, state.messageID, requestID);
+    const onComplete = (state: ClaudeStreamState): void => {
+      commitClaudeContinuity(this.continuity, prepared.diagnostics, state.messageID, requestID);
+      rememberClaudeOAuthToolAliases(this.toolAliases, prepared.bodyForTranslation, toolAliases, state.messageID);
+    };
     const chunks =
       responseFormat === to
         ? passthroughChunks(decoded, restore, signal, onComplete)
         : translatedChunks(decoded, restore, withClientToolSearch({ signal }, toolSearch), responseFormat, req.model, applyPatchOriginalRequest(req, opts), prepared.bodyForTranslation, onComplete);
-    return { headers: res.headers, chunks };
+    return { headers: res.headers, chunks: fastRequest ? wrapClaudeFastStreamErrors(chunks, fastRequest, res.status) : chunks };
   }
 
   async countTokens(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
@@ -534,7 +619,7 @@ export class ClaudeExecutor implements ProviderExecutor {
     body = normalizeClaudeToolChoice(this.identifier, upstreamModel, body);
     body = applyRequestThinking(body, req, opts, from, to, this.identifier);
     body = restoreClaudeWebSearchResults(this.webSearchResults, this.webSearchScope(auth, req, opts, originalPayload), body);
-    if (this.cfg.rebuildMidSystemMessage) body = rebuildMidSystemMessagesToTopLevel(body);
+    if (this.rebuildMidSystemMessageEnabled(auth)) body = rebuildMidSystemMessagesToTopLevel(body);
     const directAnthropic = isAnthropicUpstreamBase(baseURL);
     const [policy] = resolveClaudeWirePolicy(this.cfg, auth, apiKey, confirmedClaudeCode);
     const cloaked = policy.cloak;
@@ -545,6 +630,7 @@ export class ClaudeExecutor implements ProviderExecutor {
     body = lifted.body;
     // Claude Code 2.1.220's beta.messages.countTokens() always appends this beta.
     const extraBetas = [...lifted.betas, claudeTokenCountingBeta];
+    if (fp.profileClaudeCodeCLI && cloaked) body = remapOAuthToolNames(body, resolveClaudeMCPAliasSecret(opts.metadata, req.metadata)).body;
     body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(body, baseModel);
     body = stripPromptCacheOptions(body);
     // api.anthropic.com rejects these fields on count_tokens ("Extra inputs are not permitted").

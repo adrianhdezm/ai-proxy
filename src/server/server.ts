@@ -17,6 +17,9 @@ import { type ResponsesWebsocketConnection, ResponsesWebsocketHandler, type Resp
 import { claudeErrorMessage, claudeErrorResponse } from "./errors.ts";
 import { usageStatisticsResponse } from "../usage/http.ts";
 import type { UsageStatistics } from "../usage/statistics.ts";
+import { readBoundedRequestBody } from "./request_body.ts";
+import { compressResponse, type ResponseCompressionOptions } from "./response_compression.ts";
+import { safeDiagnosticForLog } from "../util/diagnostic.ts";
 
 export interface ServerOptions {
   manager: ExecutionManager;
@@ -41,6 +44,8 @@ export interface ServerOptions {
   disableImageGeneration?: boolean;
   /** Ping interval for idle /v1/responses websocket turns in ms (0 = off). */
   responsesWebsocketKeepAliveMs?: number;
+  /** Negotiated downstream response compression; on by default as upstream (server.response-compression). */
+  responseCompression?: ResponseCompressionOptions;
 }
 
 export interface ProxyServer {
@@ -57,6 +62,11 @@ export interface ProxyServer {
   readonly responsesHandler: OpenAIResponsesAPIHandler;
   /** The /v1/responses websocket handler (GET /v1/responses upgrades on the listening server). */
   readonly responsesWebsocketHandler: ResponsesWebsocketHandler;
+  /**
+   * Replaces the inbound API keys. Open websocket sessions re-check every turn against
+   * the new set (Go: access manager provider update on config reload).
+   */
+  setAPIKeys(keys: string[]): void;
 }
 
 /** Request headers browser clients may send (Go: corsAllowedRequestHeaders). */
@@ -75,6 +85,7 @@ export function serverOptionsFromConfig(config: Config, manager: ExecutionManage
     apiKeys: config.access.apiKeys,
     passthroughHeaders: config.requests.passthroughHeaders,
     disableImageGeneration: config.multimedia.disableImageGeneration,
+    responseCompression: config.server.responseCompression,
   };
 }
 
@@ -87,7 +98,12 @@ export function createServer(options: ServerOptions): ProxyServer {
     usage: options.usage,
     now: options.now,
   });
-  const apiKeys = new Set((options.apiKeys ?? []).map((key) => key.trim()).filter((key) => key !== ""));
+  const apiKeys = new Set<string>();
+  const setAPIKeys = (keys: string[]) => {
+    apiKeys.clear();
+    for (const key of keys) if (key.trim() !== "") apiKeys.add(key.trim());
+  };
+  setAPIKeys(options.apiKeys ?? []);
   const maxBodyBytes = Math.max(0, Math.trunc(options.maxRequestBodyBytes ?? 0));
   const imagesHandler = new OpenAIImagesHandler({
     manager: options.manager,
@@ -124,9 +140,9 @@ export function createServer(options: ServerOptions): ProxyServer {
 
     if (method === "OPTIONS") return new Response(null, { status: 204 });
 
-    if (path === "/" || path === "/health") {
+    if (path === "/" || path === "/health" || path === "/healthz") {
       if (method !== "GET" && method !== "HEAD") return methodNotAllowed(["GET"]);
-      return new Response(JSON.stringify({ status: "ok" }), { status: 200, headers: { "Content-Type": "application/json" } });
+      return new Response(method === "HEAD" ? null : JSON.stringify({ status: "ok" }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
     if (path === "/v0/usage") {
@@ -163,7 +179,7 @@ export function createServer(options: ServerOptions): ProxyServer {
         return openAIErrorResponse(openAIErrorMessage(400, { message: "websocket upgrade required for GET /v1/responses", type: "invalid_request_error" }));
       }
       if (method !== "POST") return methodNotAllowed(["POST"]);
-      const body = await readRequestBody(request, maxBodyBytes);
+      const body = await readRequestBody(request, maxBodyBytes, { decodeContentEncoding: true });
       if ("error" in body) {
         const status = body.error.status;
         return openAIErrorResponse(openAIErrorMessage(status, { message: status === 413 ? "request body too large" : "Invalid request: unreadable body", type: "invalid_request_error" }));
@@ -196,9 +212,10 @@ export function createServer(options: ServerOptions): ProxyServer {
     try {
       response = await route(request);
     } catch (err) {
-      log.error("unhandled request error:", err instanceof Error ? err.message : String(err));
+      log.error("unhandled request error:", safeDiagnosticForLog(err instanceof Error ? err.message : String(err)));
       response = errorResponse(500, "api_error", "Internal Server Error");
     }
+    response = await compressResponse(request, response, options.responseCompression);
     applyCORS(response.headers, request);
     return response;
   };
@@ -239,6 +256,7 @@ export function createServer(options: ServerOptions): ProxyServer {
     handler,
     responsesHandler,
     responsesWebsocketHandler,
+    setAPIKeys,
     start() {
       if (server) return server;
       const serveOptions = {
@@ -370,21 +388,12 @@ function extractBearerToken(header: string): string {
 
 /**
  * Reads the request body enforcing the configured size limit
- * (Go: maxRequestBodyBytesMiddleware). Oversized bodies yield a 413 in the
- * Claude error shape.
+ * (Go: maxRequestBodyBytesMiddleware + ReadRequestBody). Oversized bodies yield
+ * a 413 in the Claude error shape; the caller re-shapes it for OpenAI routes.
  */
-export async function readRequestBody(request: Request, maxBytes: number): Promise<{ text: string } | { error: Response }> {
-  const tooLarge = () => ({ error: claudeErrorResponse(claudeErrorMessage(413, "request_too_large", "request body too large")) });
-  if (maxBytes > 0) {
-    const declared = Number(request.headers.get("Content-Length") ?? "");
-    if (Number.isFinite(declared) && declared > maxBytes) return tooLarge();
-  }
-  let bytes: ArrayBuffer;
-  try {
-    bytes = await request.arrayBuffer();
-  } catch (err) {
-    return { error: claudeErrorResponse(claudeErrorMessage(400, "invalid_request_error", `Invalid request: ${err instanceof Error ? err.message : String(err)}`)) };
-  }
-  if (maxBytes > 0 && bytes.byteLength > maxBytes) return tooLarge();
-  return { text: new TextDecoder().decode(bytes) };
+export async function readRequestBody(request: Request, maxBytes: number, options: { decodeContentEncoding?: boolean } = {}): Promise<{ text: string } | { error: Response }> {
+  const result = await readBoundedRequestBody(request, maxBytes, options);
+  if ("tooLarge" in result) return { error: claudeErrorResponse(claudeErrorMessage(413, "request_too_large", "request body too large")) };
+  if ("error" in result) return { error: claudeErrorResponse(claudeErrorMessage(400, "invalid_request_error", `Invalid request: ${result.error}`)) };
+  return { text: new TextDecoder().decode(result.bytes) };
 }

@@ -24,6 +24,8 @@ import { type ExecOptions, type ExecRequest, type ExecResponse, type ProviderExe
 import { newGeminiStatusErr, translatedClaudeErrorPayload } from "./errors.ts";
 import { baseModelOf, deleteJSONFields, fixGeminiImageAspectRatio, originalRequestOf, translateToGemini } from "./request.ts";
 import { type ExecutorFetch, geminiStreamChunks, postUpstream } from "./stream.ts";
+import { newResponseModelReporter, publishResponseModelAfter } from "../response_model.ts";
+import { effectiveProxyURL } from "../proxy.ts";
 import { parseGeminiCLIUsage } from "./usage.ts";
 
 export const GeminiCLIExecutorIdentifier = "gemini-cli";
@@ -149,7 +151,8 @@ export class GeminiCLIExecutor implements ProviderExecutor {
   }
 
   private proxyFor(auth: Auth, opts?: ExecOptions): string | undefined {
-    return opts?.proxyUrl ?? (auth.proxyUrl && auth.proxyUrl !== "" ? auth.proxyUrl : this.globalProxy);
+    // Token refresh passes no options: a request override never applies to it (Go: WithoutRequestProxyURL).
+    return effectiveProxyURL(opts?.proxyUrl, auth.proxyUrl, this.globalProxy);
   }
 
   /**
@@ -230,6 +233,9 @@ export class GeminiCLIExecutor implements ProviderExecutor {
       });
       const data = await resp.text();
       if (resp.status >= 200 && resp.status < 300) {
+        const reporter = newResponseModelReporter(this.identifier, req.model, auth);
+        reporter.observeResponseModel(data);
+        reporter.publish();
         const state: TranslatorState = {};
         let out = defaultRegistry.translateNonStream({ signal: opts.signal }, FormatGemini, responseFormat, req.model, originalRequestOf(req, opts), body, data, state);
         if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
@@ -301,9 +307,10 @@ export class GeminiCLIExecutor implements ProviderExecutor {
         };
         return { headers: resp.headers, chunks: chunks() };
       }
+      const reporter = newResponseModelReporter(this.identifier, req.model, auth);
       return {
         headers: resp.headers,
-        chunks: geminiStreamChunks({
+        chunks: publishResponseModelAfter(geminiStreamChunks({
           response: resp,
           responseFormat,
           model: req.model,
@@ -313,7 +320,8 @@ export class GeminiCLIExecutor implements ProviderExecutor {
           detectPromptBlock: false,
           dataLinesOnly: true,
           signal: opts.signal,
-        }),
+          onPayload: (payload) => reporter.observeResponseModel(payload),
+        }), reporter),
       };
     }
     throw newGeminiStatusErr(lastStatus === 0 ? 429 : lastStatus, lastBody, lastHeaders);

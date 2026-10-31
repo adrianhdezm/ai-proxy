@@ -32,6 +32,7 @@ import type { UsageStatistics } from "../usage/statistics.ts";
 import type { StreamDelivery } from "../usage/stream_delivery.ts";
 import { CallerAPIKeyMetadataKey, type ExecutionManager } from "./claude_handlers.ts";
 import { enrichAuthSelectionError, executionErrorMessage } from "./errors.ts";
+import { getRequestDetails, type RequestDetails } from "./routing.ts";
 import { filterUpstreamHeaders, forwardableInboundHeaders, writeUpstreamHeaders } from "./headers.ts";
 import { openAIErrorMessage, openAIErrorResponse } from "./images_handlers.ts";
 import {
@@ -307,15 +308,10 @@ export class OpenAIResponsesAPIHandler {
    * stripped for the lookup (Go: getRequestDetails). An unroutable model is a
    * 400 model_not_found request error.
    */
-  getRequestDetails(modelName: string): { providers: string[]; model: string } | { error: ErrorMessage } {
-    const baseModel = parseSuffix(modelName).modelName.trim();
-    let providers = baseModel === "" ? [] : this.registry.getModelProviders(baseModel);
-    if (providers.length === 0 && baseModel !== modelName) providers = this.registry.getModelProviders(modelName);
-    if (providers.length === 0) {
-      return { error: openAIErrorMessage(400, { message: `unknown provider for model ${modelName}`, type: "invalid_request_error", code: "model_not_found", param: "model" }) };
-    }
-    return { providers, model: modelName };
+  getRequestDetails(modelName: string): RequestDetails {
+    return getRequestDetails(this.registry, modelName);
   }
+
 
   private prepare(request: Request, body: ParsedBody, stream: boolean, alt: string, clientKey: string): Prepared | { error: ErrorMessage } {
     const modelName = typeof body.object.model === "string" ? body.object.model : "";

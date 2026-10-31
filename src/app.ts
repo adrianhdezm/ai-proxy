@@ -7,20 +7,38 @@
 // Usage statistics (usage.statisticsEnabled) are kept in memory and served on
 // GET /v0/usage instead of the management API.
 //
+// Model registration follows registerModelsForAuth: provider catalog or the
+// config models of the credential's resolved config entry, exclusions (the
+// credential's own patterns, else oauth-excluded-models), OAuth model aliases
+// (oauth-model-alias plus per-auth model_aliases), oauth-settings and the
+// routing prefix.
+//
 // Dropped from upstream: the file watcher / hot reload, management API,
-// plugins, Home mode, OAuth model alias pools and the
+// plugins, Home mode, registration fences/epochs, force-model-prefix and the
 // compatibility-provider catalogs.
 import type { Server } from "bun";
 import { newLoginManager, type LoginManager } from "./auth/login.ts";
-import { AuthManager, authKind, AuthKindAPIKey, setQuotaCooldownDisabled, setTransientErrorCooldownSeconds, type AutoRefreshLoop } from "./auth/manager/index.ts";
+import {
+  AuthManager,
+  authKind,
+  AuthKindAPIKey,
+  FillFirstSelector,
+  RoundRobinSelector,
+  setQuotaCooldownDisabled,
+  setTransientErrorCooldownSeconds,
+  type AutoRefreshLoop,
+  type Selector,
+} from "./auth/manager/index.ts";
 import { StatusDisabled, type Auth } from "./auth/types.ts";
-import { modelOverridesFor, synthesizeApiKeyAuths } from "./config/auths.ts";
-import type { Config, ModelOverride } from "./config/types.ts";
+import { resolveConfigEntry, synthesizeApiKeyAuths } from "./config/auths.ts";
+import { normalizeModalities, resolveOAuthModelSetting, sanitizeOAuthModelAlias, validateCredentialWeights } from "./config/load.ts";
+import type { Config, ModelOverride, OAuthModelAlias, RoutingStrategy } from "./config/types.ts";
 import { applyClaudeToolSearchSetting, createExecutors } from "./executor/index.ts";
 import type { ProviderExecutor } from "./executor/types.ts";
 import { log, setLogLevel } from "./log.ts";
 import {
   applyExcludedModels,
+  applyModelAliases,
   cloneModelInfo,
   getAIStudioModels,
   getClaudeModels,
@@ -29,6 +47,7 @@ import {
   getGeminiCLIModels,
   getGlobalRegistry,
   getStaticModelDefinitionsByChannel,
+  resolveModelInfo,
   rewriteModelInfoName,
   type ModelInfo,
   type ModelRegistry,
@@ -70,6 +89,11 @@ export interface App {
   stop(): Promise<void>;
   /** Registers (or replaces) a credential at runtime and publishes its models. */
   registerAuth(auth: Auth): Auth;
+  /**
+   * Removes a credential at runtime and withdraws its models (Go: applyCoreAuthRemoval).
+   * A later registerAuth with the same id starts from fresh runtime state.
+   */
+  removeAuth(id: string): void;
   /** The model list the server advertises on /v1/models (Anthropic list shape, uncloaked). */
   models(): JSONObject[];
   readonly refreshLoop: AutoRefreshLoop | undefined;
@@ -82,6 +106,12 @@ export interface App {
  * auto-refresh loop and the HTTP server (Go: cliproxy.Service start-up).
  */
 export async function createApp(config: Config, options: AppOptions = {}): Promise<App> {
+  // Go: Builder.Build rejects an invalid credential weight before anything starts.
+  try {
+    validateCredentialWeights(config);
+  } catch (err) {
+    throw new Error(`validate credential weights: ${(err as Error).message}`);
+  }
   setLogLevel(config.debug ? "debug" : config.loggingLevel);
   const store = options.store ?? createTokenStore(config.auth, { fetch: options.fetch, now: options.now });
   const loginManager = newLoginManager(store);
@@ -99,6 +129,7 @@ export async function createApp(config: Config, options: AppOptions = {}): Promi
     now: options.now,
     cooldownDisabled: config.routing.cooldown.disabled,
     refreshLead: (auth) => loginManager.refreshLead(auth.provider),
+    selector: newRoutingSelector(config.routing.strategy),
   });
   manager.setRetryConfig(config.routing.retry.maxAttempts, config.routing.retry.maxRetryIntervalSeconds * 1000, config.routing.retry.maxRetryCredentials);
 
@@ -149,11 +180,33 @@ export async function createApp(config: Config, options: AppOptions = {}): Promi
       registerAuthModels(registry, config, effective);
       return effective;
     },
+    removeAuth(id) {
+      const key = id.trim();
+      if (key === "") return;
+      manager.remove(key);
+      registry.unregisterClient(key);
+    },
     models: () => registry.getAvailableModels("claude"),
     get refreshLoop() {
       return refreshLoop ?? manager.autoRefreshLoop();
     },
   };
+}
+
+/**
+ * The credential selector for routing.strategy (Go: newRoutingSelector). The manager has
+ * no weighted selector, so "weighted-round-robin" runs as round-robin.
+ */
+export function newRoutingSelector(strategy: RoutingStrategy): Selector {
+  switch (strategy) {
+    case "fill-first":
+      return new FillFirstSelector();
+    case "weighted-round-robin":
+      log.warn("routing.strategy weighted-round-robin is not supported; using round-robin");
+      return new RoundRobinSelector();
+    default:
+      return new RoundRobinSelector();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,30 +240,34 @@ export function registerAuthModels(registry: ModelRegistry, config: Config, auth
 }
 
 /**
- * The model list for a credential: the provider catalog, replaced by the
- * configured models (aliases) of an API-key entry, minus the excluded
- * patterns, with the routing prefix applied (Go: registerModelsForAuth switch).
+ * The model list for a credential (Go: registerModelsForAuth switch):
  *
- * - claude: static Claude catalog, or the config `models` of the key.
- * - codex: OAuth -> catalog for the ChatGPT plan; API key -> config `models`,
- *   falling back to the Pro catalog.
+ * - claude: static Claude catalog, or the `models` of the resolved config entry.
+ * - codex: OAuth -> catalog for the ChatGPT plan; API key -> the config entry's
+ *   `models`, else the Pro catalog without configuration_update; an API key with
+ *   no matching config entry advertises nothing.
  * - openai: config `models`; without them the static OpenAI channel when the
  *   catalog has one (it does not today), so the key advertises nothing.
  * - gemini-cli: static Gemini CLI catalog. aistudio: static AI Studio catalog
  *   or the config `models` of the key.
+ *
+ * Then exclusions, OAuth model aliases, OAuth settings and the routing prefix.
  */
 export function modelsForAuth(config: Config, auth: Auth): ModelInfo[] {
   const provider = registryProviderForAuth(auth);
-  const kind = authKind(auth);
-  const overrides = modelOverridesFor(config, auth);
+  const isAPIKey = authKind(auth) === AuthKindAPIKey;
+  const entry = resolveConfigEntry(config, auth);
+  const overrides = entry?.models ?? [];
+  let excluded = excludedModelsFor(config, auth);
+  if (isAPIKey && entry) excluded = entry.excludedModels;
   let models: ModelInfo[];
   switch (provider) {
     case "claude":
       models = overrides.length > 0 ? buildConfigModels(overrides, "anthropic", "claude") : getClaudeModels();
       break;
     case "codex":
-      if (kind === AuthKindAPIKey) {
-        models = overrides.length > 0 ? buildConfigModels(overrides, "openai", "openai") : getCodexProModels().map(withoutConfigurationUpdate);
+      if (isAPIKey) {
+        models = entry ? buildCodexConfigModels(overrides) : [];
       } else {
         models = getCodexModelsForPlan(codexPlanType(auth));
       }
@@ -227,8 +284,111 @@ export function modelsForAuth(config: Config, auth: Auth): ModelInfo[] {
     default:
       models = getStaticModelDefinitionsByChannel(provider) ?? [];
   }
-  models = applyExcludedModels(models, excludedModelsOf(auth));
+  models = applyExcludedModels(models, excluded);
+  const channel = oauthModelAliasChannel(provider, isAPIKey);
+  if (channel !== "") {
+    models = applyModelAliases(models, oauthModelAliasesForAuth(config, channel, auth));
+    models = applyOAuthSettings(config, channel, models);
+  }
   return applyModelPrefixes(models, auth.prefix ?? "");
+}
+
+/**
+ * Codex API-key models (Go: buildCodexConfigModels): the configured models with their
+ * display names and per-model configuration_update support, or the Pro catalog with
+ * configuration_update turned off when the key configures none.
+ */
+export function buildCodexConfigModels(overrides: ReadonlyArray<ModelOverride>): ModelInfo[] {
+  if (overrides.length === 0) return getCodexProModels().map(withoutConfigurationUpdate);
+  const models = buildConfigModels(overrides, "openai", "openai");
+  const configurationUpdates = new Map<string, boolean>();
+  for (const override of overrides) {
+    const alias = override.alias.trim() || override.name.trim();
+    if (alias === "") continue;
+    const key = alias.toLowerCase();
+    if (!configurationUpdates.has(key)) configurationUpdates.set(key, override.supportConfigurationUpdate === true);
+  }
+  for (const model of models) model.supportConfigurationUpdate = configurationUpdates.get(model.id.toLowerCase()) === true;
+  return models;
+}
+
+/**
+ * Exclusion patterns for an auth: the credential's own patterns win; otherwise
+ * oauth-excluded-models for the auth's provider applies to OAuth credentials, so a
+ * global change takes effect on the next registration (Go: oauthExcludedModelsForConfig
+ * plus the excluded_models attribute override).
+ */
+export function excludedModelsFor(config: Config, auth: Auth): string[] {
+  const own = excludedModelsOf(auth);
+  if (own.length > 0) return own;
+  if (authKind(auth) === AuthKindAPIKey) return [];
+  const global = config.oauthExcludedModels ?? {};
+  const registryProvider = registryProviderForAuth(auth);
+  const rawProvider = (auth.provider ?? "").trim().toLowerCase();
+  return global[registryProvider] ?? global[rawProvider] ?? [];
+}
+
+/** The oauth-model-alias / oauth-settings channel of an auth; "" for API keys (Go: OAuthModelAliasChannel). */
+export function oauthModelAliasChannel(registryProvider: string, isAPIKey: boolean): string {
+  if (isAPIKey) return "";
+  return registryProvider.trim().toLowerCase();
+}
+
+/**
+ * Per-auth aliases (attribute `model_aliases` as JSON, or metadata `model_aliases`)
+ * followed by the channel's global aliases; a later entry with an alias already taken
+ * is dropped (Go: oauthModelAliasesForAuth).
+ */
+export function oauthModelAliasesForAuth(config: Config, channel: string, auth: Auth): OAuthModelAlias[] {
+  const perAuth = perAuthModelAliases(auth);
+  const global = config.oauthModelAlias?.[channel] ?? [];
+  if (perAuth.length === 0) return global;
+  if (global.length === 0) return perAuth;
+  const out: OAuthModelAlias[] = [];
+  const seen = new Set<string>();
+  for (const entry of [...perAuth, ...global]) {
+    const alias = entry.alias.trim();
+    if (alias === "" || seen.has(alias.toLowerCase())) continue;
+    seen.add(alias.toLowerCase());
+    out.push(entry);
+  }
+  return out;
+}
+
+function perAuthModelAliases(auth: Auth): OAuthModelAlias[] {
+  let raw: unknown = auth.metadata?.model_aliases;
+  const attr = (auth.attributes?.model_aliases ?? "").trim();
+  if (attr !== "") {
+    try {
+      raw = JSON.parse(attr);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(raw)) return [];
+  const entries = raw
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item))
+    .map((item) => ({
+      name: typeof item.name === "string" ? item.name : "",
+      alias: typeof item.alias === "string" ? item.alias : "",
+      fork: item.fork === true,
+      displayName: typeof item["display-name"] === "string" ? (item["display-name"] as string) : typeof item.display_name === "string" ? (item.display_name as string) : "",
+      forceMapping: item["force-mapping"] === true || item.force_mapping === true,
+    }));
+  return sanitizeOAuthModelAlias({ auth: entries }).auth ?? [];
+}
+
+/** Applies oauth-settings context-length overrides to a channel's models (Go: applyOAuthSettingEntries). */
+export function applyOAuthSettings(config: Config, channel: string, models: ReadonlyArray<ModelInfo>): ModelInfo[] {
+  const settings = config.oauthSettings?.[channel] ?? [];
+  if (settings.length === 0 || models.length === 0 || channel === "") return [...models];
+  return models.map((model) => {
+    const setting = resolveOAuthModelSetting(settings, model.id, model.metadataModelId ?? "", model.name ?? "");
+    if (!setting || setting.maxContextLength <= 0) return model;
+    const clone = cloneModelInfo(model);
+    clone.contextLength = setting.maxContextLength;
+    return clone;
+  });
 }
 
 function withoutConfigurationUpdate(model: ModelInfo): ModelInfo {
@@ -263,8 +423,10 @@ export function excludedModelsOf(auth: Auth): string[] {
 
 /**
  * Builds user-defined ModelInfos from a credential's configured models: the id
- * is the alias (or the name), metadataModelId the upstream name
- * (Go: buildConfigModels / buildConfiguredModelInfo).
+ * is the alias (or the name), metadataModelId the upstream name, and the
+ * thinking support that of the upstream name's catalog entry unless the model
+ * configures its own (Go: buildConfigModels / buildConfiguredModelInfo /
+ * modelconfig.ResolveModelInfo).
  */
 export function buildConfigModels(models: ReadonlyArray<ModelOverride>, ownedBy: string, modelType: string, nowSeconds = Math.floor(Date.now() / 1000)): ModelInfo[] {
   const out: ModelInfo[] = [];
@@ -292,7 +454,10 @@ export function buildConfigModels(models: ReadonlyArray<ModelOverride>, ownedBy:
     };
     if (model.maxContextLength > 0) info.contextLength = model.maxContextLength;
     if (model.isCompat) info.isCompat = true;
-    if (model.thinking) info.thinking = structuredClone(model.thinking);
+    const resolved = resolveModelInfo(name, modelType, model.thinking);
+    if (resolved.thinking) info.thinking = resolved.thinking;
+    const modalities = normalizeModalities(model.inputModalities);
+    if (modalities.length > 0) info.supportedInputModalities = modalities;
     out.push(info);
   }
   return out;

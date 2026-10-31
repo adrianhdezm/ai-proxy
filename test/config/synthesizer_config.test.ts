@@ -218,7 +218,8 @@ describe("port specifics", () => {
     const auths = synthesizeApiKeyAuths(cfg);
     expect(modelOverridesFor(cfg, auths[0]!)).toEqual([]);
     expect(modelOverridesFor(cfg, auths[1]!)).toEqual(models);
-    const oauth = { ...auths[1]!, attributes: { ...auths[1]!.attributes, source_backend: "file" } };
+    // Without a config source or a matching API key nothing resolves (Go: resolveConfigCodexStyleKey).
+    const oauth = { ...auths[1]!, attributes: { source_backend: "file" } };
     expect(modelOverridesFor(cfg, oauth)).toEqual([]);
   });
 });

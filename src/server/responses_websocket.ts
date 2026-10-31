@@ -55,6 +55,7 @@ import { RequestUsageRecorder } from "../usage/recorder.ts";
 import type { UsageStatistics } from "../usage/statistics.ts";
 import { CallerAPIKeyMetadataKey, type ExecutionManager } from "./claude_handlers.ts";
 import { enrichAuthSelectionError, executionErrorMessage } from "./errors.ts";
+import { getRequestDetails, type RequestDetails } from "./routing.ts";
 import { openAIErrorMessage } from "./images_handlers.ts";
 import { parseResponsesUsageNode, responsesForwardableHeaders } from "./responses_handlers.ts";
 import { isCodexResponsesClientRequest } from "./responses_sse.ts";
@@ -287,15 +288,10 @@ export class ResponsesWebsocketHandler {
   }
 
   /** Go: getRequestDetails. */
-  requestDetails(modelName: string): { providers: string[]; model: string } | { error: ErrorMessage } {
-    const base = parseSuffix(modelName).modelName.trim();
-    let providers = base === "" ? [] : this.registry.getModelProviders(base);
-    if (providers.length === 0 && base !== modelName) providers = this.registry.getModelProviders(modelName);
-    if (providers.length === 0) {
-      return { error: openAIErrorMessage(400, { message: `unknown provider for model ${modelName}`, type: "invalid_request_error", code: "model_not_found", param: "model" }) };
-    }
-    return { providers, model: modelName };
+  requestDetails(modelName: string): RequestDetails {
+    return getRequestDetails(this.registry, modelName);
   }
+
 }
 
 interface InputFrame {

@@ -76,20 +76,19 @@ test("no configured keys leaves the API open", async () => {
   expect(response.status).toBe(200);
 });
 
-test("unknown model -> 404 not_found_error; thinking suffix is stripped for the lookup", async () => {
+test("unknown model -> 400 invalid_request_error (Go: getRequestDetails); thinking suffix is stripped for the lookup", async () => {
   const manager = okManager();
   const server = createServer({ manager, registry: registryWith({ id: "claude-sonnet-4-6" }) });
   const unknown = await server.fetch(messagesRequest("gpt-unknown", false));
-  expect(unknown.status).toBe(404);
+  expect(unknown.status).toBe(400);
   const body = (await unknown.json()) as { type: string; error: { type: string; message: string } };
   expect(body.type).toBe("error");
-  expect(body.error.type).toBe("not_found_error");
-  expect(body.error.message).toContain("model not found");
-  expect(body.error.message).toContain("gpt-unknown");
+  expect(body.error.type).toBe("invalid_request_error");
+  expect(body.error.message).toBe("unknown provider for model gpt-unknown");
   expect(manager.calls).toHaveLength(0);
 
   const streaming = await server.fetch(messagesRequest("gpt-unknown", true));
-  expect(streaming.status).toBe(404);
+  expect(streaming.status).toBe(400);
   expect(streaming.headers.get("Content-Type")).toBe("application/json");
 
   const suffixed = await server.fetch(messagesRequest("claude-sonnet-4-6(high)", false));

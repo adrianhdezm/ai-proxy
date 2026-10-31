@@ -149,15 +149,16 @@ test("createApp routes /v1/messages through the executors end to end", async () 
     // ends with an api_error frame.
     const aliased = await app.fetch(messagesRequest("team/codex-fast", false, { headers: { "x-api-key": "sk-proxy" } }));
     expect(aliased.status).toBe(200);
-    expect(codex.executeCalls[0]!.model).toBe("team/codex-fast");
+    // The manager strips the routing prefix (and, with its config wired, resolves the alias to gpt-5.4).
+    expect(["codex-fast", "gpt-5.4"]).toContain(codex.executeCalls[0]!.model);
     const truncated = await app.fetch(messagesRequest("codex-fast", true, { headers: { "x-api-key": "sk-proxy" } }));
     expect(truncated.status).toBe(200);
     const truncatedText = await truncated.text();
     expect(truncatedText).toContain(`event: error\ndata: {"type":"error","error":{"type":"api_error"`);
 
-    // Unknown model -> 404 before any executor runs.
+    // Unknown model -> 400 model_not_found before any executor runs (Go: getRequestDetails).
     const unknown = await app.fetch(messagesRequest("gemini-nope", false, { headers: { "x-api-key": "sk-proxy" } }));
-    expect(unknown.status).toBe(404);
+    expect(unknown.status).toBe(400);
 
     // A provider without an executor (gemini-cli) fails with the manager's no-auth error, not a crash.
     const geminiModel = getGeminiCLIModels()[0]!.id;
@@ -191,7 +192,10 @@ test("modelsForAuth / buildConfigModels / applyModelPrefixes", () => {
   expect(openai[0]!.displayName).toBe("gpt-4.1");
   // Without configured models an OpenAI key advertises nothing (no static OpenAI channel).
   expect(modelsForAuth(config, testAuth({ id: "openai:apikey:2", provider: "openai", attributes: { api_key: "k", auth_kind: "apikey" } }))).toEqual([]);
-  // A codex API key without configured models falls back to the Pro catalog.
+  // A codex API key without configured models falls back to the Pro catalog; one with no
+  // matching codex-api-key entry advertises nothing.
+  expect(modelsForAuth(config, testAuth({ id: "codex:apikey:0", provider: "codex", attributes: { api_key: "k", auth_kind: "apikey" } }))).toEqual([]);
+  config.codexApiKeys = [credential({ apiKey: "k" })];
   const codexKey = modelsForAuth(config, testAuth({ id: "codex:apikey:1", provider: "codex", attributes: { api_key: "k", auth_kind: "apikey" } }));
   expect(codexKey.length).toBeGreaterThan(0);
   expect(codexKey.every((m) => m.supportConfigurationUpdate === false)).toBe(true);

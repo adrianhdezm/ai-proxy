@@ -23,6 +23,7 @@ import { tryParse } from "../../util/json.ts";
 import { log } from "../../log.ts";
 import { RequestPathMetadataKey, StatusError, type ExecOptions, type ExecRequest, type ExecResponse, type StreamResult } from "../types.ts";
 import { newOpenAICompatStatusError } from "./errors.ts";
+import { applyFetchProxy } from "../proxy.ts";
 
 /** Source format of the /v1/images/* handlers (Go: openAICompatImageHandlerType / codexOpenAIImageSourceFormat). */
 export const FormatOpenAIImage = "openai-image";
@@ -387,8 +388,7 @@ async function sendImages(ctx: OpenAIImagesContext, auth: Auth, req: ExecRequest
 
   const url = baseURL.replace(/\/+$/, "") + endpointPath;
   const init: RequestInit & { proxy?: string } = { method: "POST", headers, body: requestBodyOf(prepared), signal: opts.signal };
-  const proxy = (opts.proxyUrl ?? auth.proxyUrl ?? ctx.proxyUrl ?? "").trim();
-  if (proxy !== "") init.proxy = proxy;
+  applyFetchProxy(init, opts.proxyUrl, auth.proxyUrl, ctx.proxyUrl);
   return ctx.fetch(url, init);
 }
 
