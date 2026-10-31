@@ -4,8 +4,11 @@
 // service_executors.go, service_models.go} (registerModelsForAuth, buildConfigModels,
 // applyModelPrefixes), reduced to the three kept upstreams.
 //
+// Usage statistics (usage.statisticsEnabled) are kept in memory and served on
+// GET /v0/usage instead of the management API.
+//
 // Dropped from upstream: the file watcher / hot reload, management API,
-// plugins, Home mode, usage statistics, OAuth model alias pools and the
+// plugins, Home mode, OAuth model alias pools and the
 // compatibility-provider catalogs.
 import type { Server } from "bun";
 import { newLoginManager, type LoginManager } from "./auth/login.ts";
@@ -32,6 +35,7 @@ import {
 } from "./registry/index.ts";
 import { createTokenStore, type FetchLike, type PersistingTokenStore } from "./store/index.ts";
 import { createServer, serverOptionsFromConfig, type ProxyServer } from "./server/server.ts";
+import { UsageStatistics } from "./usage/statistics.ts";
 import type { JSONObject } from "./util/json.ts";
 
 export interface AppOptions {
@@ -56,6 +60,8 @@ export interface App {
   readonly manager: AuthManager;
   readonly registry: ModelRegistry;
   readonly server: ProxyServer;
+  /** In-memory usage statistics (records are discarded when usage.statisticsEnabled is false). */
+  readonly usage: UsageStatistics;
   /** The HTTP handler (works without a listening socket). */
   fetch(request: Request): Promise<Response>;
   /** Starts listening. */
@@ -117,7 +123,8 @@ export async function createApp(config: Config, options: AppOptions = {}): Promi
   log.info(`loaded ${manager.list().length} credential(s); providers: ${providers.join(", ") || "none"}; models: ${registry.getAvailableModelInfos().length}`);
 
   const refreshLoop = options.autoRefresh === false ? undefined : manager.startAutoRefresh();
-  const server = createServer(serverOptionsFromConfig(config, manager, registry));
+  const usage = new UsageStatistics({ enabled: config.usage.statisticsEnabled, now: options.now });
+  const server = createServer({ ...serverOptionsFromConfig(config, manager, registry), usage, now: options.now });
 
   return {
     config,
@@ -126,6 +133,7 @@ export async function createApp(config: Config, options: AppOptions = {}): Promi
     manager,
     registry,
     server,
+    usage,
     fetch: (request) => server.fetch(request),
     start: () => server.start(),
     async stop() {

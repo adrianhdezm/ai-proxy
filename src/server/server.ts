@@ -8,6 +8,8 @@ import { log } from "../log.ts";
 import type { ModelRegistry } from "../registry/index.ts";
 import { ClaudeCodeAPIHandler, type ExecutionManager } from "./claude_handlers.ts";
 import { claudeErrorMessage, claudeErrorResponse } from "./errors.ts";
+import { usageStatisticsResponse } from "../usage/http.ts";
+import type { UsageStatistics } from "../usage/statistics.ts";
 
 export interface ServerOptions {
   manager: ExecutionManager;
@@ -24,6 +26,10 @@ export interface ServerOptions {
   passthroughHeaders?: boolean;
   /** Rewrite non-claude model ids in /v1/models (see ClaudeHandlerOptions). */
   cloakModelList?: boolean;
+  /** Usage statistics store backing GET /v0/usage and the per-request records. */
+  usage?: UsageStatistics;
+  /** Clock (epoch ms) for usage records. */
+  now?: () => number;
 }
 
 export interface ProxyServer {
@@ -62,6 +68,8 @@ export function createServer(options: ServerOptions): ProxyServer {
     registry: options.registry,
     passthroughHeaders: options.passthroughHeaders,
     cloakModelList: options.cloakModelList,
+    usage: options.usage,
+    now: options.now,
   });
   const apiKeys = new Set((options.apiKeys ?? []).map((key) => key.trim()).filter((key) => key !== ""));
   const maxBodyBytes = Math.max(0, Math.trunc(options.maxRequestBodyBytes ?? 0));
@@ -82,6 +90,14 @@ export function createServer(options: ServerOptions): ProxyServer {
       return new Response(JSON.stringify({ status: "ok" }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
+    if (path === "/v0/usage") {
+      const usageAuthError = authenticate(request, url, apiKeys);
+      if (usageAuthError) return errorResponse(401, "authentication_error", usageAuthError);
+      if (!options.usage?.enabled) return errorResponse(404, "not_found_error", "usage statistics are disabled");
+      if (method !== "GET" && method !== "HEAD") return methodNotAllowed(["GET"]);
+      return usageStatisticsResponse(options.usage, url);
+    }
+
     if (!path.startsWith("/v1/")) return errorResponse(404, "not_found_error", `Not Found: ${method} ${path}`);
 
     const authError = authenticate(request, url, apiKeys);
@@ -91,7 +107,7 @@ export function createServer(options: ServerOptions): ProxyServer {
       if (method !== "POST") return methodNotAllowed(["POST"]);
       const body = await readRequestBody(request, maxBodyBytes);
       if ("error" in body) return body.error;
-      return path === "/v1/messages" ? handler.claudeMessages(request, body.text) : handler.claudeCountTokens(request, body.text);
+      return path === "/v1/messages" ? handler.claudeMessages(request, body.text, { clientKey: authenticatedAPIKey(request, url, apiKeys) }) : handler.claudeCountTokens(request, body.text);
     }
 
     if (path === "/v1/models") {
@@ -206,6 +222,23 @@ export function authenticate(request: Request, url: URL, apiKeys: ReadonlySet<st
     if (candidate !== "" && apiKeys.has(candidate)) return undefined;
   }
   return "invalid API key";
+}
+
+/**
+ * The configured inbound key the request authenticated with, checked in the
+ * same order as authenticate(); "" when access is open or nothing matched.
+ * Only used for usage attribution, where it is stored masked.
+ */
+export function authenticatedAPIKey(request: Request, url: URL, apiKeys: ReadonlySet<string>): string {
+  if (apiKeys.size === 0) return "";
+  const candidates = [
+    extractBearerToken(request.headers.get("Authorization") ?? ""),
+    request.headers.get("X-Goog-Api-Key") ?? "",
+    request.headers.get("X-Api-Key") ?? "",
+    url.searchParams.get("key") ?? "",
+    url.searchParams.get("auth_token") ?? "",
+  ];
+  return candidates.find((candidate) => candidate !== "" && apiKeys.has(candidate)) ?? "";
 }
 
 function extractBearerToken(header: string): string {
