@@ -567,3 +567,541 @@ describe("NonStream_FinishReasonIncomplete", () => {
     });
   }
 });
+
+describe("NonStream_ReasoningFallback", () => {
+  for (const tt of [
+    {
+      name: "reasoning_content field present",
+      rawJSON: `{"id":"chatcmpl_rc","object":"chat.completion","created":1773896263,"model":"o3-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hello","reasoning_content":"thought from reasoning_content"},"finish_reason":"stop"}]}`,
+      requestJSON: "",
+      wantReasoning: true,
+      wantText: "thought from reasoning_content",
+    },
+    {
+      name: "reasoning fallback field present",
+      rawJSON: `{"id":"chatcmpl_r","object":"chat.completion","created":1773896263,"model":"o3-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hello","reasoning":"thought from reasoning"},"finish_reason":"stop"}]}`,
+      requestJSON: "",
+      wantReasoning: true,
+      wantText: "thought from reasoning",
+    },
+    {
+      name: "both reasoning_content and reasoning present (reasoning_content priority)",
+      rawJSON: `{"id":"chatcmpl_both","object":"chat.completion","created":1773896263,"model":"o3-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hello","reasoning_content":"priority thought","reasoning":"ignored thought"},"finish_reason":"stop"}]}`,
+      requestJSON: "",
+      wantReasoning: true,
+      wantText: "priority thought",
+    },
+    {
+      name: "empty reasoning_content falls back to reasoning",
+      rawJSON: `{"id":"chatcmpl_empty_rc","object":"chat.completion","created":1773896263,"model":"o3-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hello","reasoning_content":"","reasoning":"fallback thought"},"finish_reason":"stop"}]}`,
+      requestJSON: "",
+      wantReasoning: true,
+      wantText: "fallback thought",
+    },
+    {
+      name: "neither field present without request reasoning",
+      rawJSON: `{"id":"chatcmpl_none","object":"chat.completion","created":1773896263,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
+      requestJSON: "",
+      wantReasoning: false,
+      wantText: "",
+    },
+    {
+      name: "neither field present with request reasoning produces empty summary",
+      rawJSON: `{"id":"chatcmpl_req_only","object":"chat.completion","created":1773896263,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
+      requestJSON: `{"model":"gpt-4o","reasoning":{"effort":"medium"}}`,
+      wantReasoning: true,
+      wantText: "",
+    },
+  ]) {
+    test(tt.name, () => {
+      const out = nonStream(tt.requestJSON, tt.requestJSON, tt.rawJSON, {}, "o3-mini");
+      const reasoningItem = arr(out, "output").find((item) => str(item, "type") === "reasoning");
+      expect(reasoningItem !== undefined).toBe(tt.wantReasoning);
+      if (!tt.wantReasoning) return;
+      if (tt.wantText !== "") {
+        expect(str(reasoningItem, "summary.0.text")).toBe(tt.wantText);
+        expect(str(reasoningItem, "summary.0.type")).toBe("summary_text");
+      } else {
+        expect(arr(reasoningItem, "summary").length).toBe(0);
+      }
+    });
+  }
+});
+
+test("EmptyToolCallsArrayDoesNotTerminateItems", () => {
+  const events = runStream(
+    `{"model":"codebuddy-hy4"}`,
+    [
+      `data: {"id":"chatcmpl_empty_tc","object":"chat.completion.chunk","created":1773896263,"model":"codebuddy-hy4","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"Thinking part 1, ","function_call":null,"refusal":"","tool_calls":[]},"finish_reason":null}]}`,
+      `data: {"id":"chatcmpl_empty_tc","object":"chat.completion.chunk","created":1773896263,"model":"codebuddy-hy4","choices":[{"index":0,"delta":{"content":"","reasoning_content":"thinking part 2.","function_call":null,"refusal":"","tool_calls":[]},"finish_reason":null}]}`,
+      `data: {"id":"chatcmpl_empty_tc","object":"chat.completion.chunk","created":1773896263,"model":"codebuddy-hy4","choices":[{"index":0,"delta":{"content":"Hello ","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[]},"finish_reason":null}]}`,
+      `data: {"id":"chatcmpl_empty_tc","object":"chat.completion.chunk","created":1773896263,"model":"codebuddy-hy4","choices":[{"index":0,"delta":{"content":"world!","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[]},"finish_reason":"stop"}]}`,
+      `data: [DONE]`,
+    ],
+    "codebuddy-hy4",
+  );
+  const count = (event: string, type: string) => events.filter((e) => e.event === event && str(e.data, "item.type") === type);
+  expect(count("response.output_item.added", "reasoning").length).toBe(1);
+  expect(count("response.output_item.done", "reasoning").length).toBe(1);
+  expect(str(count("response.output_item.done", "reasoning")[0]!.data, "item.summary.0.text")).toBe("Thinking part 1, thinking part 2.");
+  expect(count("response.output_item.added", "message").length).toBe(1);
+  expect(count("response.output_item.done", "message").length).toBe(1);
+  expect(str(count("response.output_item.done", "message")[0]!.data, "item.content.0.text")).toBe("Hello world!");
+  const completed = events.filter((e) => e.event === "response.completed");
+  expect(completed.length).toBe(1);
+  expect(str(completed[0]!.data, "response.output.0.summary.0.text")).toBe("Thinking part 1, thinking part 2.");
+  expect(str(completed[0]!.data, "response.output.1.content.0.text")).toBe("Hello world!");
+});
+
+function itemOrder(events: Event[]): string[] {
+  return events
+    .filter((e) => e.event === "response.output_item.added" || e.event === "response.output_item.done")
+    .map((e) => `${e.event === "response.output_item.added" ? "added" : "done"}:${str(e.data, "item.type")}:${int(e.data, "output_index")}`);
+}
+
+test("ChunkWithContentAndReasoningContent", () => {
+  const events = runStream(
+    `{"model":"deepseek-v4-flash"}`,
+    [
+      `data: {"id":"chatcmpl_ds","object":"chat.completion.chunk","created":1773896263,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Thinking part 1,"},"finish_reason":null}]}`,
+      `data: {"id":"chatcmpl_ds","object":"chat.completion.chunk","created":1773896263,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"Bien","reasoning_content":" Just professional."},"finish_reason":null}]}`,
+      `data: {"id":"chatcmpl_ds","object":"chat.completion.chunk","created":1773896263,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":" continues here."},"finish_reason":"stop"}]}`,
+      `data: [DONE]`,
+    ],
+    "deepseek-v4-flash",
+  );
+  expect(itemOrder(events)).toEqual(["added:reasoning:0", "done:reasoning:0", "added:message:1", "done:message:1"]);
+  const doneOf = (type: string) => events.find((e) => e.event === "response.output_item.done" && str(e.data, "item.type") === type)!.data;
+  expect(str(doneOf("reasoning"), "item.summary.0.text")).toBe("Thinking part 1, Just professional.");
+  expect(str(doneOf("message"), "item.content.0.text")).toBe("Bien continues here.");
+  const addedIDs = events.filter((e) => e.event === "response.output_item.added").map((e) => str(e.data, "item.id"));
+  expect(addedIDs.length).toBe(2);
+  expect(addedIDs[0]).not.toBe(addedIDs[1]);
+  const completed = events.filter((e) => e.event === "response.completed");
+  expect(completed.length).toBe(1);
+  expect(str(completed[0]!.data, "response.output.0.summary.0.text")).toBe("Thinking part 1, Just professional.");
+  expect(str(completed[0]!.data, "response.output.1.content.0.text")).toBe("Bien continues here.");
+});
+
+test("SingleChunkWithBothContentAndReasoningContent", () => {
+  const events = runStream(
+    `{"model":"deepseek-v4-flash"}`,
+    [
+      `data: {"id":"chatcmpl_single","object":"chat.completion.chunk","created":1773896263,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"Answer","reasoning_content":"Thought"},"finish_reason":"stop"}]}`,
+      `data: [DONE]`,
+    ],
+    "deepseek-v4-flash",
+  );
+  expect(itemOrder(events)).toEqual(["added:reasoning:0", "done:reasoning:0", "added:message:1", "done:message:1"]);
+  const completed = completedOf(events);
+  expect(str(completed, "response.output.0.summary.0.text")).toBe("Thought");
+  expect(str(completed, "response.output.1.content.0.text")).toBe("Answer");
+});
+
+// --- apply_patch over Chat Completions ---
+
+const applyPatchChatStart = (index: number, id: string, name: string) =>
+  `data: {"id":"r1","choices":[{"index":0,"delta":{"tool_calls":[{"index":${index},"id":${q(id)},"type":"function","function":{"name":${q(name)},"arguments":""}}]}}]}`;
+const applyPatchChatFragment = (index: number, fragment: string) => `data: {"id":"r1","choices":[{"index":0,"delta":{"tool_calls":[{"index":${index},"function":{"arguments":${q(fragment)}}}]}}]}`;
+const applyPatchChatEnd = () => [`data: {"id":"r1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`, `data: [DONE]`];
+const applyPatchChatRequest = `{"tools":[{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: patch"}}]}`;
+
+/** Feeds chunks with the original request only (Go passed nil as the translated request). */
+function patchStream(request = applyPatchChatRequest): { s: Stream; feed: (chunk: string) => unknown[] } {
+  const s = new Stream(request, "", "test");
+  return { s, feed: (chunk: string) => s.feed(chunk).map((e) => e.data) };
+}
+const toolInputError = (s: Stream) => (s.state.value as { toolInputError(): Error | undefined }).toolInputError();
+
+test("ApplyPatchChatPreviewBeforeDone", () => {
+  const { feed } = patchStream();
+  feed(applyPatchChatStart(0, "c1", "apply_patch"));
+  const preview = feed(applyPatchChatFragment(0, `{"input":"*** Begin Patch\\n*** Add File: a.txt\\n+hello\\n`));
+  expect(preview.length).toBe(1);
+  expect(str(preview[0], "type")).toBe("response.custom_tool_call_input.delta");
+  expect(str(preview[0], "delta")).toBe("*** Begin Patch\n*** Add File: a.txt\n+hello\n");
+  expect(str(preview[0], "call_id")).toBe("c1");
+  expect(str(preview[0], "item_id")).toBe("ctc_c1");
+  const events = [...preview, ...feed(applyPatchChatFragment(0, `*** End Patch"}`)), ...applyPatchChatEnd().flatMap(feed)];
+  const want = "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch";
+  let deltas = "";
+  let seenDone = false;
+  let seenItem = false;
+  let seenCompleted = false;
+  let lastSequence = 0;
+  for (const event of events) {
+    const sequence = int(event, "sequence_number");
+    expect(sequence).toBeGreaterThan(lastSequence);
+    lastSequence = sequence;
+    switch (str(event, "type")) {
+      case "response.custom_tool_call_input.delta":
+        deltas += str(event, "delta");
+        break;
+      case "response.custom_tool_call_input.done":
+        seenDone = true;
+        expect(deltas).toBe(want);
+        expect(str(event, "input")).toBe(want);
+        expect(str(event, "call_id")).toBe("c1");
+        break;
+      case "response.output_item.done":
+        seenItem = true;
+        expect(seenDone).toBe(true);
+        expect(str(event, "item.input")).toBe(want);
+        break;
+      case "response.completed":
+        seenCompleted = true;
+        expect(seenItem).toBe(true);
+        expect(str(event, "response.output.0.input")).toBe(want);
+        break;
+    }
+  }
+  expect(seenDone && seenItem && seenCompleted).toBe(true);
+});
+
+test("ApplyPatchChatLateIdentityAndInterleavedCalls", () => {
+  const { feed } = patchStream();
+  feed(applyPatchChatStart(0, "", ""));
+  for (const event of feed(applyPatchChatFragment(0, `{"input":"first\\n`))) {
+    expect(str(event, "type").includes("arguments.delta") || str(event, "type") === "response.custom_tool_call_input.delta").toBe(false);
+  }
+  const events = [
+    ...feed(applyPatchChatStart(0, "c1", "apply_patch")),
+    ...feed(applyPatchChatStart(1, "c2", "apply_patch")),
+    ...feed(applyPatchChatFragment(1, `{"input":"second`)),
+    ...feed(applyPatchChatFragment(0, `tail"}`)),
+    ...feed(applyPatchChatFragment(1, ` tail"}`)),
+    ...applyPatchChatEnd().flatMap(feed),
+  ];
+  const inputs: Record<string, string> = {};
+  const indices: Record<string, number> = {};
+  const done: Record<string, string> = {};
+  for (const event of events) {
+    switch (str(event, "type")) {
+      case "response.custom_tool_call_input.delta":
+        inputs[str(event, "call_id")] = (inputs[str(event, "call_id")] ?? "") + str(event, "delta");
+        indices[str(event, "call_id")] = int(event, "output_index");
+        break;
+      case "response.custom_tool_call_input.done":
+        done[str(event, "call_id")] = str(event, "input");
+        break;
+      case "response.failed":
+        throw new Error(`interleaved calls failed: ${JSON.stringify(event)}`);
+    }
+  }
+  expect(inputs.c1).toBe("first\ntail");
+  expect(inputs.c2).toBe("second tail");
+  expect(done.c1).toBe(inputs.c1!);
+  expect(done.c2).toBe(inputs.c2!);
+  expect(indices.c1).not.toBe(indices.c2);
+});
+
+describe("ApplyPatchChatInvalidArgumentsFailOnce", () => {
+  for (const args of [`plain patch`, `{}`, `{"input":42}`, `{"input":"x","extra":1}`, `{"input":"x","input":"y"}`, `{"input":"x"} {}`, `{"input":"unfinished`, `{"input":"bad\\q"}`, `{"input":"\\ud800"}`]) {
+    test(args, () => {
+      const { s, feed } = patchStream();
+      const events = [
+        ...feed(applyPatchChatStart(0, "c1", "apply_patch")),
+        ...feed(applyPatchChatFragment(0, args)),
+        ...applyPatchChatEnd().flatMap(feed),
+        ...applyPatchChatEnd().flatMap(feed),
+      ];
+      let failureCount = 0;
+      for (const event of events) {
+        const type = str(event, "type");
+        if (type === "response.failed") {
+          failureCount++;
+          expect(str(event, "response.error.code")).toBe("invalid_tool_arguments");
+        }
+        expect(["response.completed", "response.incomplete", "response.custom_tool_call_input.done", "response.output_item.done"].includes(type)).toBe(false);
+      }
+      expect(failureCount).toBe(1);
+      expect(toolInputError(s)).toBeDefined();
+    });
+  }
+});
+
+describe("ApplyPatchChatWinnerAndNamespace", () => {
+  for (const tc of [
+    { name: "function", request: `{"tools":[{"type":"function","name":"apply_patch"}]}`, upstream: "apply_patch", wantType: "function_call", wantName: "apply_patch", namespace: "" },
+    {
+      name: "function wins",
+      request: `{"tools":[{"type":"function","name":"apply_patch"}],"input":[{"type":"additional_tools","tools":[{"type":"custom","name":"apply_patch"}]}]}`,
+      upstream: "apply_patch",
+      wantType: "function_call",
+      wantName: "apply_patch",
+      namespace: "",
+    },
+    {
+      name: "custom wins",
+      request: `{"tools":[{"type":"custom","name":"apply_patch"}],"input":[{"type":"additional_tools","tools":[{"type":"function","name":"apply_patch"}]}]}`,
+      upstream: "apply_patch",
+      wantType: "custom_tool_call",
+      wantName: "apply_patch",
+      namespace: "",
+    },
+    {
+      name: "namespace",
+      request: `{"tools":[{"type":"namespace","name":"editor","tools":[{"type":"custom","name":"apply_patch"}]}]}`,
+      upstream: "editor__apply_patch",
+      wantType: "custom_tool_call",
+      wantName: "apply_patch",
+      namespace: "editor",
+    },
+    {
+      name: "flat collision",
+      request: `{"tools":[{"type":"function","name":"editor__apply_patch"},{"type":"namespace","name":"editor","tools":[{"type":"custom","name":"apply_patch"}]}]}`,
+      upstream: "editor__apply_patch",
+      wantType: "function_call",
+      wantName: "editor__apply_patch",
+      namespace: "",
+    },
+    {
+      name: "same source custom first",
+      request: `{"tools":[{"type":"custom","name":"apply_patch"},{"type":"function","name":"apply_patch"}]}`,
+      upstream: "apply_patch",
+      wantType: "custom_tool_call",
+      wantName: "apply_patch",
+      namespace: "",
+    },
+    {
+      name: "same source function first",
+      request: `{"tools":[{"type":"function","name":"apply_patch"},{"type":"custom","name":"apply_patch"}]}`,
+      upstream: "apply_patch",
+      wantType: "function_call",
+      wantName: "apply_patch",
+      namespace: "",
+    },
+    {
+      name: "namespace before flat",
+      request: `{"tools":[{"type":"namespace","name":"editor","tools":[{"type":"custom","name":"apply_patch"}]},{"type":"function","name":"editor__apply_patch"}]}`,
+      upstream: "editor__apply_patch",
+      wantType: "custom_tool_call",
+      wantName: "apply_patch",
+      namespace: "editor",
+    },
+    { name: "other custom", request: `{"tools":[{"type":"custom","name":"edit"}]}`, upstream: "edit", wantType: "custom_tool_call", wantName: "edit", namespace: "" },
+  ]) {
+    test(tc.name, () => {
+      const { feed } = patchStream(tc.request);
+      feed(applyPatchChatStart(0, "c1", tc.upstream));
+      const args = tc.wantType === "function_call" || tc.name === "other custom" ? `{"not_input":42}` : `{"input":"x"}`;
+      const events = [...feed(applyPatchChatFragment(0, args)), ...applyPatchChatEnd().flatMap(feed)];
+      const item = get(events.find((e) => str(e, "type") === "response.completed"), "response.output.0");
+      expect(str(item, "type")).toBe(tc.wantType);
+      expect(str(item, "name")).toBe(tc.wantName);
+      expect(str(item, "namespace")).toBe(tc.namespace);
+      if (tc.wantType === "function_call") expect(str(item, "arguments")).toBe(args);
+      if (tc.name === "other custom") expect(str(item, "input")).toBe(args);
+    });
+  }
+});
+
+describe("ApplyPatchChatNonStreamStrictInput", () => {
+  for (const tc of [
+    { args: `{"input":"*** Begin Patch\\n*** End Patch"}`, want: "*** Begin Patch\n*** End Patch", invalid: false },
+    { args: `{"input":12}`, want: "", invalid: true },
+    { args: `{"input":"truncated`, want: "", invalid: true },
+    { args: `{"input":"x","extra":true}`, want: "", invalid: true },
+    { args: `{"input":"\\ud800"}`, want: "", invalid: true },
+  ]) {
+    test(tc.args, () => {
+      const state: { value?: unknown } = {};
+      const raw = `{"id":"r1","choices":[{"index":0,"message":{"tool_calls":[{"id":"c1","function":{"name":"apply_patch","arguments":${q(tc.args)}}}]},"finish_reason":"tool_calls"}]}`;
+      const result = nonStream(applyPatchChatRequest, "", raw, state, "test");
+      if (tc.invalid) {
+        expect(str(result, "status")).toBe("failed");
+        expect(str(result, "error.code")).toBe("invalid_tool_arguments");
+        expect((state.value as { toolInputError(): Error | undefined }).toolInputError()).toBeDefined();
+      } else {
+        expect(str(result, "output.0.input")).toBe(tc.want);
+      }
+    });
+  }
+});
+
+test("ApplyPatchChatTerminalValidatesTruncatedCall", () => {
+  const { feed } = patchStream();
+  feed(applyPatchChatStart(0, "c1", "apply_patch"));
+  feed(applyPatchChatFragment(0, `{"input":"unfinished`));
+  const chunks = applyPatchChatEnd();
+  const events = feed(chunks[chunks.length - 1]!);
+  expect(events.length).toBe(1);
+  expect(str(events[0], "type")).toBe("response.failed");
+});
+
+test("ApplyPatchChatUnicodeFragments", () => {
+  const args = `{"input":"line\\n\\u4f60\\u597d \\ud83d\\ude00 \\" \\\\ \\u96ea"}`;
+  for (let split = 1; split < args.length; split++) {
+    const { feed } = patchStream();
+    feed(applyPatchChatStart(0, "c1", "apply_patch"));
+    const events = [...feed(applyPatchChatFragment(0, args.slice(0, split))), ...feed(applyPatchChatFragment(0, args.slice(split))), ...applyPatchChatEnd().flatMap(feed)];
+    const input = events
+      .filter((e) => str(e, "type") === "response.custom_tool_call_input.delta")
+      .map((e) => str(e, "delta"))
+      .join("");
+    expect(input, `split ${split}`).toBe('line\n你好 😀 " \\ 雪');
+  }
+});
+
+test("ApplyPatchChatIdentityFieldsArriveSeparately", () => {
+  for (const tc of [
+    { id: "c1", name: "" },
+    { id: "", name: "apply_patch" },
+  ]) {
+    const { feed } = patchStream();
+    feed(applyPatchChatStart(0, tc.id, tc.name));
+    expect(feed(applyPatchChatFragment(0, `{"input":"preview`)).length).toBe(0);
+    let found = false;
+    for (const event of feed(applyPatchChatStart(0, "c1", "apply_patch"))) {
+      if (str(event, "type") === "response.custom_tool_call_input.delta") found = str(event, "delta") === "preview" && str(event, "call_id") === "c1";
+    }
+    expect(found).toBe(true);
+  }
+});
+
+test("ApplyPatchChatConflictingIdentityFails", () => {
+  for (const tc of [
+    { id: "other", name: "apply_patch" },
+    { id: "c1", name: "other" },
+  ]) {
+    const { feed } = patchStream();
+    feed(applyPatchChatStart(0, "c1", "apply_patch"));
+    feed(applyPatchChatFragment(0, `{"input":"preview`));
+    const events = [...feed(applyPatchChatStart(0, tc.id, tc.name)), ...applyPatchChatEnd().flatMap(feed)];
+    expect(events.length).toBe(1);
+    expect(str(events[0], "type")).toBe("response.failed");
+  }
+});
+
+test("ApplyPatchChatNonStreamOriginalDeclarationWins", () => {
+  const raw = `{"id":"r1","choices":[{"index":0,"message":{"tool_calls":[{"id":"c1","function":{"name":"apply_patch","arguments":"{\\"not_input\\":42}"}}]},"finish_reason":"tool_calls"}]}`;
+  const result = nonStream(`{"tools":[{"type":"function","name":"apply_patch"}]}`, applyPatchChatRequest, raw, {}, "test");
+  expect(str(result, "output.0.type")).toBe("function_call");
+  expect(str(result, "output.0.arguments")).toBe(`{"not_input":42}`);
+});
+
+test("ApplyPatchChatPendingIdentityConflictFails", () => {
+  const { feed } = patchStream();
+  feed(applyPatchChatStart(0, "c1", ""));
+  feed(applyPatchChatFragment(0, `{"input":"x"}`));
+  const events = feed(applyPatchChatStart(0, "c2", "apply_patch"));
+  expect(events.length).toBe(1);
+  expect(str(events[0], "type")).toBe("response.failed");
+});
+
+test("ApplyPatchChatMissingIDSynthesizedAtTerminal", () => {
+  const { feed } = patchStream();
+  feed(applyPatchChatStart(0, "", "apply_patch"));
+  feed(applyPatchChatFragment(0, `{"input":"x"}`));
+  const completed = applyPatchChatEnd()
+    .flatMap(feed)
+    .find((e) => str(e, "type") === "response.completed");
+  const item = get(completed, "response.output.0");
+  expect(str(item, "type")).toBe("custom_tool_call");
+  expect(str(item, "input")).toBe("x");
+  expect(str(item, "call_id")).not.toBe("");
+});
+
+describe("ApplyPatchChatDeferredIdentityConflict", () => {
+  for (const tc of [
+    { name: "return to first ID", request: applyPatchChatRequest, resolvedID: "c1", resolvedName: "apply_patch", wantType: "", invalid: true },
+    { name: "keep second ID", request: applyPatchChatRequest, resolvedID: "c2", resolvedName: "apply_patch", wantType: "", invalid: true },
+    { name: "omit final ID", request: applyPatchChatRequest, resolvedID: "", resolvedName: "apply_patch", wantType: "", invalid: true },
+    { name: "infer name at terminal", request: applyPatchChatRequest, resolvedID: "c1", resolvedName: "", wantType: "", invalid: true },
+    { name: "ordinary function", request: `{"tools":[{"type":"function","name":"apply_patch"}]}`, resolvedID: "c1", resolvedName: "apply_patch", wantType: "function_call", invalid: false },
+    {
+      name: "function winner",
+      request: `{"tools":[{"type":"function","name":"apply_patch"},{"type":"custom","name":"apply_patch"}]}`,
+      resolvedID: "c1",
+      resolvedName: "apply_patch",
+      wantType: "function_call",
+      invalid: false,
+    },
+    { name: "other custom", request: `{"tools":[{"type":"custom","name":"edit"}]}`, resolvedID: "c1", resolvedName: "edit", wantType: "custom_tool_call", invalid: false },
+  ]) {
+    test(tc.name, () => {
+      const { s, feed } = patchStream(tc.request);
+      feed(applyPatchChatStart(0, "c1", ""));
+      expect(feed(`data: {"id":"r1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"name":"","arguments":"{\\"input\\":\\"x\\"}"}}]}}]}`).length).toBe(0);
+      const events = [...feed(applyPatchChatStart(0, tc.resolvedID, tc.resolvedName)), ...applyPatchChatEnd().flatMap(feed)];
+      let failures = 0;
+      let completions = 0;
+      let item: unknown;
+      for (const event of events) {
+        const type = str(event, "type");
+        if (type === "response.failed") {
+          failures++;
+          expect(tc.invalid).toBe(true);
+          expect(str(event, "response.error.code")).toBe("invalid_tool_arguments");
+        } else if (type === "response.completed") {
+          completions++;
+          item = get(event, "response.output.0");
+        } else if (["response.incomplete", "response.custom_tool_call_input.done", "response.output_item.done"].includes(type)) {
+          expect(tc.invalid).toBe(false);
+        }
+      }
+      if (tc.invalid) {
+        expect(failures).toBe(1);
+        expect(completions).toBe(0);
+        expect(toolInputError(s)).toBeDefined();
+        return;
+      }
+      expect(completions).toBe(1);
+      expect(toolInputError(s)).toBeUndefined();
+      expect(str(item, "type")).toBe(tc.wantType);
+      expect(str(item, "call_id")).toBe("c1");
+      if (tc.wantType === "function_call") expect(str(item, "arguments")).toBe(`{"input":"x"}`);
+      if (tc.wantType === "custom_tool_call") expect(str(item, "input")).toBe("x");
+    });
+  }
+});
+
+describe("ApplyPatchChatSuccessfulTerminalSealsState", () => {
+  for (const tc of [
+    { name: "duplicate DONE", late: `data: [DONE]` },
+    { name: "post-terminal fragment", late: applyPatchChatFragment(0, `{"input":"late"}`) },
+  ]) {
+    test(tc.name, () => {
+      const { s, feed } = patchStream();
+      feed(applyPatchChatStart(0, "c1", "apply_patch"));
+      feed(applyPatchChatFragment(0, `{"input":"x"}`));
+      const end = applyPatchChatEnd();
+      for (const event of feed(end[0]!)) expect(str(event, "type")).not.toBe("response.completed");
+      feed(`data: {"id":"r1","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}`);
+      const events = feed(end[1]!);
+      expect(events.length).toBe(1);
+      expect(str(events[0], "type")).toBe("response.completed");
+      expect(str(events[0], "response.output.0.input")).toBe("x");
+      expect(int(events[0], "response.usage.total_tokens")).toBe(15);
+      for (const chunk of [tc.late, end[1]!]) expect(feed(chunk).length).toBe(0);
+      expect(toolInputError(s)).toBeUndefined();
+    });
+  }
+});
+
+describe("NonStream_MapsCompletionTokensDetailsReasoningTokens", () => {
+  const request = `{"model":"mercury-3"}`;
+  for (const tc of [
+    { name: "completion_tokens_details.reasoning_tokens", usageJSON: `{"prompt_tokens":9,"completion_tokens":99,"total_tokens":108,"completion_tokens_details":{"reasoning_tokens":60}}`, want: 60 },
+    { name: "output_tokens_details.reasoning_tokens", usageJSON: `{"prompt_tokens":9,"completion_tokens":99,"total_tokens":108,"output_tokens_details":{"reasoning_tokens":45}}`, want: 45 },
+  ]) {
+    test(tc.name, () => {
+      const raw = `{"id":"chatcmpl_reasoning","object":"chat.completion","created":1773896263,"model":"mercury-3","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":${tc.usageJSON}}`;
+      const resp = nonStream(request, request, raw, {}, "mercury-3");
+      expect(has(resp, "usage.output_tokens_details.reasoning_tokens")).toBe(true);
+      expect(int(resp, "usage.output_tokens_details.reasoning_tokens")).toBe(tc.want);
+    });
+  }
+});
+
+test("finalizeToolInput fails an apply_patch stream that ended without [DONE]", () => {
+  const { s, feed } = patchStream();
+  feed(applyPatchChatStart(0, "c1", "apply_patch"));
+  feed(applyPatchChatFragment(0, `{"input":"x`));
+  const state = s.state.value as { canFinalizeResponseStream(): boolean; finalizeToolInput(): string[] };
+  expect(state.canFinalizeResponseStream()).toBe(false);
+  const frames = state.finalizeToolInput();
+  expect(frames.length).toBe(1);
+  expect(frames[0]!.startsWith("event: response.failed\n")).toBe(true);
+  expect(toolInputError(s)).toBeDefined();
+});
