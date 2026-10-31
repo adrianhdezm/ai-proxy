@@ -55,6 +55,9 @@ export interface ClaudeHandlerOptions {
 
 const sseErrorPrefix = "event: error\ndata: ";
 
+/** Request metadata key carrying the authenticated inbound API key (never logged or returned). */
+export const CallerAPIKeyMetadataKey = "cliproxy.caller_api_key";
+
 export class ClaudeCodeAPIHandler {
   private readonly manager: ExecutionManager;
   private readonly registry: ModelRegistry;
@@ -98,7 +101,7 @@ export class ClaudeCodeAPIHandler {
     return claudeErrorResponse(claudeErrorMessage(404, "not_found_error", `model not found: ${id}`), { passthroughHeaders: this.passthroughHeaders });
   }
 
-  /** POST /v1/messages (Go: ClaudeMessages). */
+    /** POST /v1/messages (Go: ClaudeMessages). */
   async claudeMessages(request: Request, rawJSON: string, context: ClaudeRequestContext = {}): Promise<Response> {
     const usage: UsageContext = { start: this.now(), clientKey: context.clientKey ?? "", alias: "" };
     const parsed = parseRequestBody(rawJSON);
@@ -153,7 +156,7 @@ export class ClaudeCodeAPIHandler {
     return { providers, model: modelName };
   }
 
-  private prepareExecution(request: Request, body: ParsedBody, stream: boolean): { providers: string[]; req: ExecRequest; opts: ExecOptions } | { error: ErrorMessage } {
+  private prepareExecution(request: Request, body: ParsedBody, stream: boolean, clientKey?: string): { providers: string[]; req: ExecRequest; opts: ExecOptions } | { error: ErrorMessage } {
     const modelName = typeof body.object.model === "string" ? body.object.model : "";
     const details = this.getRequestDetails(modelName);
     if ("error" in details) return details;
@@ -161,6 +164,9 @@ export class ClaudeCodeAPIHandler {
     const metadata: Record<string, unknown> = { [RequestedModelMetadataKey]: modelName, [RequestPathMetadataKey]: url.pathname };
     const idempotencyKey = request.headers.get("Idempotency-Key")?.trim();
     if (idempotencyKey) metadata.idempotency_key = idempotencyKey;
+    // The authenticated inbound key scopes per-caller caches (Go: APIKeyFromContext).
+    // It is request-internal: executors use it only to derive hashed cache keys.
+    if (clientKey) metadata[CallerAPIKeyMetadataKey] = clientKey;
     const req: ExecRequest = { model: details.model, payload: body.raw, format: FormatClaude };
     const opts: ExecOptions = {
       stream,
@@ -195,7 +201,7 @@ export class ClaudeCodeAPIHandler {
   }
 
   private async handleNonStreamingResponse(request: Request, body: ParsedBody, usage?: UsageContext): Promise<Response> {
-    const prepared = this.prepareExecution(request, body, false);
+    const prepared = this.prepareExecution(request, body, false, usage?.clientKey);
     if ("error" in prepared) return this.errorResponse(prepared.error);
     const recorder = this.usageRecorder(request, body, prepared, usage);
     let resp: ExecResponse;
@@ -218,7 +224,7 @@ export class ClaudeCodeAPIHandler {
    * (Go: handleStreamingResponse + forwardClaudeStreamWithState).
    */
   private async handleStreamingResponse(request: Request, body: ParsedBody, usage?: UsageContext): Promise<Response> {
-    const prepared = this.prepareExecution(request, body, true);
+    const prepared = this.prepareExecution(request, body, true, usage?.clientKey);
     if ("error" in prepared) return this.errorResponse(prepared.error);
     const { providers, req, opts } = prepared;
     const recorder = this.usageRecorder(request, body, prepared, usage);

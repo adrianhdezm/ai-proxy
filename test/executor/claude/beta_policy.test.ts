@@ -1,7 +1,6 @@
 // Ported from: internal/runtime/executor/claude_executor_beta_policy_test.go
 // Skipped cases: TestApplyClaudeHeaders_StructuredHelperBetaOrderPreservedWithAdvisor (measured Haiku helper native
-// profile not ported), TestClaudeExecutor_ContextManagementNeverLeaksToOtherUpstreams is kept but reduced to the
-// absence of context_management (the injection itself is not ported).
+// profile not ported).
 import { describe, expect, test } from "bun:test";
 import { newAuth } from "../../../src/auth/types.ts";
 import {

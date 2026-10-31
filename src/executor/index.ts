@@ -22,6 +22,7 @@ export function createExecutors(config: Config): ProviderExecutor[] {
     createClaudeExecutor({
       proxyUrl,
       modelLevelCooling: config.upstream.claude.modelLevelCooling,
+      sessionDatePinDays: config.upstream.claude.sessionDatePinDays,
       ...(config.upstream.claude.disableCloakMode ? { cloakMode: "never" as const } : {}),
     }),
     createCodexExecutor({

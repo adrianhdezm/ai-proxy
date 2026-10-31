@@ -4,17 +4,13 @@
 // ClaudeCode220CLIFingerprint is ported in full here; the CCH, diagnostics, context_management and date-pin cases
 // live in cch_diagnostics.test.ts. Dropped here: TestApplyClaudeToolPrefix*, TestStripClaudeToolPrefix* (tool prefix
 // not ported), TestRemapOAuthToolNames*, TestReverseRemap*, TestPrepareClaudeOAuthToolNames*, TestResolveClaudeMCPAlias*,
-// *MCPAlias* (MCP alias remapping not ported), TestInjectClaudeCodeCurrentDate*, TestClaudeCodeLocalDate*,
-// TestClaudeCodeTimezone*, TestClaudeCallerCurrentDate*, TestApplyCloakingStringCallerReminder* (date reminder),
-// TestCheckSystemInstructionsWithMode*, TestRelocateClaudeSystemPromptForCountTokens*, TestPrependClaudeSystemReminders*,
-// TestInsertClaudeMidConversationSystemMessages* (system relocation not ported), TestClaudeBillingFingerprint*,
-// TestCheckSystemInstructionsWithSigningMode*, TestClaudeExecutor_CustomBaseURL*CCH* (CCH signing),
+// *MCPAlias* (MCP alias remapping not ported), TestCheckSystemInstructionsWithMode*, TestRelocateClaudeSystemPromptForCountTokens*, TestPrependClaudeSystemReminders*,
+// TestInsertClaudeMidConversationSystemMessages* (system relocation not ported),
 // TestApplyCloaking_*Fallback*, TestApplyCloaking_Fable*, TestApplyCloaking_Sonnet*, TestClaudeExecutor_CloakedOpus55*,
 // TestClaudeOpus55Fallback*, TestApplyCloaking_*Fable* (fallbacks/reporting-outcomes injection not ported),
 // TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWords* and *SensitiveWords* (obfuscation not ported),
-// TestClaudeExecutor_Payload* (payload config rules not ported), TestInjectClaudeCodeContextManagement,
-// TestClaudeCodeContextManagement*, TestReconcileClaudeCodeContextManagement (context_management not ported),
-// TestClaudeExecutor_PreservedThinking* (thinking replay), TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled
+// TestClaudeExecutor_Payload* (payload config rules not ported),
+// TestClaudeExecutor_PreservedThinking* (preserved-thinking block binding not ported), TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled
 // (user-id cache not ported), TestClaudeExecutor_Confirmed*AgentSDK*, *VSCode*, TestClaudeExecutor_AgentSDKEntrypoint*,
 // TestClaudeExecutor_CloakModeNeverUsesConfiguredHeaderDefaultsBaseline, TestApplyClaudeHeaders_*Baseline*,
 // TestApplyClaudeHeaders_*Fingerprint* (other than the OAuth case), TestResolveClaudeDeviceProfile*,
@@ -26,9 +22,8 @@
 // TestClaudeExecutor_CountTokensExcludesInvalidOpenAIThinking, TestClaudeExecutor_CountTokensRejectsInvalidRequests
 // (local token estimation not ported; countTokens always calls upstream), TestClaudeExecutor_CountTokensCloak*
 // (system relocation/obfuscation), TestClaudeExecutor_LegacySystemReminderAcrossMessagesAndStream,
-// TestClaudeExecutor_TitleHelperWithSystemPromptIsolated, TestClaudeExecutor_CloakModePrefersStoredPrevReqOverCallerFake,
-// TestClaudeExecutor_UserTitlePromptWithoutSchemaTreatedAsNormalTurn, TestClaudeExecutor_UncloakedProbePreservesCallerBillingTags,
-// TestClaudeExecutor_CallerOwnedDiagnosticsPreservedOnProbe (diagnostics/billing/previous-request state not ported),
+// TestClaudeExecutor_TitleHelperWithSystemPromptIsolated, TestClaudeExecutor_UserTitlePromptWithoutSchemaTreatedAsNormalTurn
+// (system relocation not ported),
 // TestClaudeExecutor_ExecuteOpenAI*, TestClaudeExecutor_ExecuteStreamOpenAIResponse*,
 // TestClaudeExecutor_ChatCompletionsDefaultMaxTokens* (no Claude->OpenAI response translator in this port),
 // TestEnsureModelMaxTokens_UsesRegisteredMaxCompletionTokens (registry fixture is static; covered by the default case).
