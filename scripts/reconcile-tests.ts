@@ -30,6 +30,13 @@ for await (const file of new Glob("test/**/*.test.ts").scan(repo)) {
   }
 }
 
+// Per-file skip reasons recorded during the catch-all review: docs/skips/*.json,
+// each a JSON object {"<go test path>": "<reason>"}.
+const reviewedReasons: Record<string, string> = {};
+for await (const file of new Glob("docs/skips/*.json").scan(repo)) {
+  Object.assign(reviewedReasons, JSON.parse(await Bun.file(join(repo, file)).text()) as Record<string, string>);
+}
+
 // 2. Enumerate upstream tests.
 const all: string[] = [];
 for (const dir of ["test", "internal", "sdk"]) {
@@ -37,6 +44,8 @@ for (const dir of ["test", "internal", "sdk"]) {
 }
 all.sort();
 
+const staleReviewed = Object.keys(reviewedReasons).filter((go) => portedBy.has(go));
+const unknownReviewed = Object.keys(reviewedReasons).filter((go) => !existsSync(join(upstream, go)));
 const missing = [...portedBy.keys()].filter((go) => !existsSync(join(upstream, go)) && !(legacy && existsSync(join(legacy, go))));
 
 // 3. Skip reasons by area (kept short; the TS headers carry the per-case detail).
@@ -48,6 +57,7 @@ const specificReasons: Record<string, string> = {
 
 function skipReason(path: string): string {
   if (specificReasons[path]) return specificReasons[path]!;
+  if (reviewedReasons[path]) return reviewedReasons[path]!;
   const b = path.slice(path.lastIndexOf("/") + 1);
   if (/benchmark|_bench_|perf_test|^race_/.test(b)) return "Go benchmark or race-detector harness";
   if (/antigravity|devin|kimi|xai|grok|meta_|vertex|iflow|qwen/.test(path)) return "dropped provider";
@@ -101,6 +111,11 @@ if (legacyRefs.length > 0) {
 }
 await Bun.write(join(repo, "docs/upstream-tests.md"), lines.join("\n"));
 console.log(`upstream=${all.length} ported=${ported.length} legacy=${legacyRefs.length - missing.length} unresolved=${missing.length}`);
+if (staleReviewed.length > 0) console.warn("Skip reasons recorded for files that are now ported (ignored):\n  " + staleReviewed.join("\n  "));
+if (unknownReviewed.length > 0) {
+  console.error("docs/skips entries naming Go files that do not exist:\n  " + unknownReviewed.join("\n  "));
+  process.exit(1);
+}
 if (missing.length > 0) {
   console.error("Headers naming Go files that do not exist:\n  " + missing.join("\n  "));
   process.exit(1);

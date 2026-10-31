@@ -1,5 +1,5 @@
-// Ported from sdk/translator/registry_test.go and sdk/translator/registry_bytes_test.go
-// (plugin-hook and request-envelope cases dropped: plugins are out of scope).
+// Ported from: sdk/translator/registry_test.go, sdk/translator/registry_bytes_test.go
+// Skipped cases: plugin-hook and request-envelope cases (plugins are out of scope).
 import { describe, expect, test } from "bun:test";
 import { TranslatorRegistry, defaultRegistry, register, unregister, hasRequestTransformer, hasNonStreamResponseTransformer, hasResponseTransformer } from "../../src/translator/registry.ts";
 import { FormatGemini, FormatOpenAI, FormatOpenAIResponse, emptyContext, type TranslatorState } from "../../src/translator/types.ts";
