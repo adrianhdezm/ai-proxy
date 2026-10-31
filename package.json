@@ -1,0 +1,19 @@
+{
+  "name": "ai-proxy",
+  "version": "0.1.0",
+  "description": "Claude Messages-compatible proxy for OpenAI Codex, Anthropic Claude and Google Gemini, with Vault-backed credentials. TypeScript/Bun port of CLIProxyAPI.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "reconcile-tests": "bun run scripts/reconcile-tests.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.5",
+    "typescript": "5.9.3"
+  }
+}

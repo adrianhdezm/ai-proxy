@@ -1,0 +1,3 @@
+[test]
+# Unit tests live under test/ mirroring src/. Fixtures live under test/fixtures/.
+timeout = 20000

@@ -111,3 +111,8 @@ dist
 
 # TernJS port file
 .tern-port
+
+# ai-proxy local state
+config.yaml
+auths/
+.env
