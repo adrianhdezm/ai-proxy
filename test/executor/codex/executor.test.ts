@@ -54,7 +54,8 @@ describe("credentials, URL and headers", () => {
 
   test("request fields Codex rejects are removed", async () => {
     const stub = stubFetch(() => sseResponse(completed));
-    const executor = new CodexExecutor({ fetch: stub.fetch });
+    // Without the injected image_generation tool the request has no tools, so parallel_tool_calls goes too.
+    const executor = new CodexExecutor({ fetch: stub.fetch, disableImageGeneration: true });
     const payload = `{"model":"gpt-5.4","input":"hi","previous_response_id":"resp_0","generate":true,"prompt_cache_retention":"24h","safety_identifier":"u","stream_options":{"include_usage":true},"parallel_tool_calls":true}`;
     await executor.execute(apiKeyAuth("https://example.test"), request("gpt-5.4", payload), options("openai-response", false));
     const body = stub.calls[0]!.body;

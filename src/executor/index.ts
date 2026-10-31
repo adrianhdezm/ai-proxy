@@ -30,6 +30,7 @@ export function createExecutors(config: Config): ProviderExecutor[] {
       disableCloaking: config.upstream.codex.disableCloaking,
       streamBootstrapBuffering: config.upstream.codex.streamBootstrapBuffering,
       streamBootstrapTimeoutMs: config.upstream.codex.streamBootstrapTimeoutMs,
+      disableImageGeneration: config.multimedia.disableImageGeneration,
     }),
     createGeminiCLIExecutor({ proxyUrl, switchPreviewModel: config.quotaExceeded.switchPreviewModel }),
     createAIStudioExecutor({ proxyUrl }),

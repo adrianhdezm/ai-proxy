@@ -8,7 +8,10 @@
 // to `<base_url>/chat/completions` with a Bearer API key; responses and SSE
 // streams are translated back to the response format (Claude).
 //
-// Not ported (upstream features outside this slice): images/video endpoints,
+// Image requests (source format "openai-image" from /v1/images/*) are passed
+// through to `<base_url>/images/generations` or `/images/edits` (images.ts).
+//
+// Not ported (upstream features outside this slice): video endpoints,
 // /responses/compact, prompt_cache_key, payload-config rules, apply_patch
 // stream repair, usage reporting/TTFT metrics, Home credential options and
 // the plugin request normalizers.
@@ -58,6 +61,7 @@ import {
 } from "./helpers.ts";
 import { newOpenAICompatStatusError, openAICompatChunkHasFinishReason, openAICompatErrorEvent, openAICompatStreamDataError } from "./errors.ts";
 import { ClaudeInputTokenState, estimateTokensByChars, newClaudeInputTokenState, translateStreamWithClaudeInputTokens } from "./claude_input_tokens.ts";
+import { type OpenAIImagesContext, executeOpenAICompatImages, executeOpenAICompatImagesStream, openAICompatImageEndpointPath } from "./images.ts";
 
 export * from "./helpers.ts";
 export * from "./errors.ts";
@@ -285,7 +289,14 @@ export class OpenAICompatExecutor implements ProviderExecutor {
     return this.fetchFn(prepared.url, init);
   }
 
+  /** What the image endpoints borrow from this executor (images.ts). */
+  private imagesContext(): OpenAIImagesContext {
+    return { identifier: this.identifier, fetch: this.fetchFn, now: this.now, proxyUrl: this.cfg?.requests.proxyUrl, credentials: resolveCredentials, ensureUserAgent: ensureOpenAICompatUserAgent };
+  }
+
   async execute(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
+    const imagesPath = openAICompatImageEndpointPath(opts);
+    if (imagesPath !== "") return executeOpenAICompatImages(this.imagesContext(), auth, req, opts, imagesPath);
     const prepared = this.prepare(auth, req, opts, false);
     const resp = await this.send(auth, prepared, opts);
     const body = await resp.text();
@@ -302,6 +313,8 @@ export class OpenAICompatExecutor implements ProviderExecutor {
   }
 
   async executeStream(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<StreamResult> {
+    const imagesPath = openAICompatImageEndpointPath(opts);
+    if (imagesPath !== "") return executeOpenAICompatImagesStream(this.imagesContext(), auth, req, opts, imagesPath);
     const prepared = this.prepare(auth, req, opts, true);
     const resp = await this.send(auth, prepared, opts);
     if (resp.status < 200 || resp.status >= 300) {

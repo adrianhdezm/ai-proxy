@@ -7,6 +7,7 @@ import type { Config } from "../config/types.ts";
 import { log } from "../log.ts";
 import type { ModelRegistry } from "../registry/index.ts";
 import { ClaudeCodeAPIHandler, type ExecutionManager } from "./claude_handlers.ts";
+import { OpenAIImagesHandler } from "./images_handlers.ts";
 import { claudeErrorMessage, claudeErrorResponse } from "./errors.ts";
 import { usageStatisticsResponse } from "../usage/http.ts";
 import type { UsageStatistics } from "../usage/statistics.ts";
@@ -30,6 +31,8 @@ export interface ServerOptions {
   usage?: UsageStatistics;
   /** Clock (epoch ms) for usage records. */
   now?: () => number;
+  /** multimedia.disableImageGeneration: /v1/images/* answer 404. */
+  disableImageGeneration?: boolean;
 }
 
 export interface ProxyServer {
@@ -59,6 +62,7 @@ export function serverOptionsFromConfig(config: Config, manager: ExecutionManage
     maxRequestBodyBytes: config.server.maxRequestBodyBytes,
     apiKeys: config.access.apiKeys,
     passthroughHeaders: config.requests.passthroughHeaders,
+    disableImageGeneration: config.multimedia.disableImageGeneration,
   };
 }
 
@@ -73,6 +77,15 @@ export function createServer(options: ServerOptions): ProxyServer {
   });
   const apiKeys = new Set((options.apiKeys ?? []).map((key) => key.trim()).filter((key) => key !== ""));
   const maxBodyBytes = Math.max(0, Math.trunc(options.maxRequestBodyBytes ?? 0));
+  const imagesHandler = new OpenAIImagesHandler({
+    manager: options.manager,
+    registry: options.registry,
+    passthroughHeaders: options.passthroughHeaders,
+    disableImageGeneration: options.disableImageGeneration,
+    maxRequestBodyBytes: maxBodyBytes,
+    usage: options.usage,
+    now: options.now,
+  });
   const passthroughHeaders = options.passthroughHeaders ?? false;
   let server: Server<undefined> | undefined;
 
@@ -108,6 +121,12 @@ export function createServer(options: ServerOptions): ProxyServer {
       const body = await readRequestBody(request, maxBodyBytes);
       if ("error" in body) return body.error;
       return path === "/v1/messages" ? handler.claudeMessages(request, body.text, { clientKey: authenticatedAPIKey(request, url, apiKeys) }) : handler.claudeCountTokens(request, body.text);
+    }
+
+    if (path === "/v1/images/generations" || path === "/v1/images/edits") {
+      if (method !== "POST") return methodNotAllowed(["POST"]);
+      const imagesContext = { clientKey: authenticatedAPIKey(request, url, apiKeys) };
+      return path === "/v1/images/generations" ? imagesHandler.imagesGenerations(request, imagesContext) : imagesHandler.imagesEdits(request, imagesContext);
     }
 
     if (path === "/v1/models") {

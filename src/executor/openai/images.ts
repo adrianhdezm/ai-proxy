@@ -84,24 +84,190 @@ export function parseMultipartContentType(contentType: string): { mediaType: str
   return { mediaType, boundary };
 }
 
-/** A multipart form parsed from raw bytes (Bun's multipart parser behind Response.formData). */
-export async function parseMultipartForm(bytes: Uint8Array, contentType: string): Promise<FormData> {
+/** An uploaded file of a multipart form (Go: multipart.FileHeader). */
+export interface UploadedFile {
+  /** The part's filename. */
+  readonly name: string;
+  /** The part's Content-Type header ("" when absent). */
+  readonly type: string;
+  readonly data: Uint8Array;
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export type MultipartValue = string | UploadedFile;
+
+/**
+ * A parsed multipart/form-data body in part order. Text fields are parts
+ * without a filename (Go: multipart.Form Value vs File). A small parser of our
+ * own is used because Bun's FormData replaces a file part's Content-Type with
+ * one guessed from the filename extension.
+ */
+export class MultipartForm {
+  constructor(readonly parts: ReadonlyArray<{ name: string; value: MultipartValue }>) {}
+
+  get(key: string): MultipartValue | null {
+    return this.parts.find((part) => part.name === key)?.value ?? null;
+  }
+
+  getAll(key: string): MultipartValue[] {
+    return this.parts.filter((part) => part.name === key).map((part) => part.value);
+  }
+
+  *entries(): IterableIterator<[string, MultipartValue]> {
+    for (const part of this.parts) yield [part.name, part.value];
+  }
+}
+
+/** Narrows a form entry to an uploaded file. */
+export function isUploadedFile(value: unknown): value is UploadedFile {
+  return typeof value === "object" && value !== null && (value as UploadedFile).data instanceof Uint8Array;
+}
+
+/** The uploaded files of a form field. */
+export function uploadedFiles(form: MultipartForm, key: string): UploadedFile[] {
+  return form.getAll(key).filter(isUploadedFile);
+}
+
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from: number): number {
+  outer: for (let i = Math.max(0, from); i <= haystack.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (haystack[i + j] !== needle[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+/** Parameters of a header value such as `form-data; name="a"; filename="b.png"` (Go: mime.ParseMediaType params). */
+export function parseHeaderParams(value: string): { value: string; params: Record<string, string> } {
+  const params: Record<string, string> = {};
+  const semi = value.indexOf(";");
+  const head = (semi < 0 ? value : value.slice(0, semi)).trim().toLowerCase();
+  let rest = semi < 0 ? "" : value.slice(semi + 1);
+  for (;;) {
+    rest = rest.replace(/^[\s;]+/, "");
+    if (rest === "") break;
+    const eq = rest.indexOf("=");
+    if (eq < 0) break;
+    const key = rest.slice(0, eq).trim().toLowerCase();
+    rest = rest.slice(eq + 1).trimStart();
+    let val = "";
+    if (rest.startsWith('"')) {
+      let i = 1;
+      for (; i < rest.length; i++) {
+        const ch = rest[i]!;
+        if (ch === "\\" && i + 1 < rest.length) {
+          val += rest[++i];
+          continue;
+        }
+        if (ch === '"') break;
+        val += ch;
+      }
+      rest = rest.slice(i + 1);
+    } else {
+      const end = rest.indexOf(";");
+      val = (end < 0 ? rest : rest.slice(0, end)).trim();
+      rest = end < 0 ? "" : rest.slice(end);
+    }
+    if (key !== "") params[key] = val;
+  }
+  return { value: head, params };
+}
+
+/** Parses multipart/form-data bytes (Go: multipart.Reader.ReadForm). */
+export function parseMultipartBytes(bytes: Uint8Array, boundary: string): MultipartForm {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const delimiter = encoder.encode("--" + boundary);
+  const nextDelimiter = encoder.encode("\r\n--" + boundary);
+  const headerEnd = encoder.encode("\r\n\r\n");
+  const parts: Array<{ name: string; value: MultipartValue }> = [];
+  let pos = indexOfBytes(bytes, delimiter, 0);
+  if (pos < 0) throw new Error("multipart: NextPart: EOF");
+  pos += delimiter.length;
+  for (;;) {
+    if (bytes[pos] === 0x2d && bytes[pos + 1] === 0x2d) break; // closing "--"
+    // Skip transport padding and the CRLF after the delimiter.
+    while (pos < bytes.length && (bytes[pos] === 0x20 || bytes[pos] === 0x09)) pos++;
+    if (bytes[pos] === 0x0d && bytes[pos + 1] === 0x0a) pos += 2;
+    else if (bytes[pos] === 0x0a) pos += 1;
+    else throw new Error("multipart: malformed part delimiter");
+    const headersEndAt = indexOfBytes(bytes, headerEnd, pos);
+    if (headersEndAt < 0) throw new Error("multipart: malformed part headers");
+    const headers = new Map<string, string>();
+    for (const line of decoder.decode(bytes.subarray(pos, headersEndAt)).split("\r\n")) {
+      const colon = line.indexOf(":");
+      if (colon <= 0) continue;
+      headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
+    }
+    const bodyStart = headersEndAt + headerEnd.length;
+    const bodyEnd = indexOfBytes(bytes, nextDelimiter, bodyStart);
+    if (bodyEnd < 0) throw new Error("multipart: NextPart: EOF");
+    const data = bytes.slice(bodyStart, bodyEnd);
+    const disposition = parseHeaderParams(headers.get("content-disposition") ?? "");
+    const name = disposition.params.name ?? "";
+    if (name !== "") {
+      if (disposition.params.filename !== undefined) {
+        const file: UploadedFile = {
+          name: disposition.params.filename,
+          type: headers.get("content-type") ?? "",
+          data,
+          arrayBuffer: async () => data.slice().buffer as ArrayBuffer,
+        };
+        parts.push({ name, value: file });
+      } else {
+        parts.push({ name, value: decoder.decode(data) });
+      }
+    }
+    pos = bodyEnd + nextDelimiter.length;
+  }
+  return new MultipartForm(parts);
+}
+
+/** A multipart form parsed from raw bytes and its Content-Type. */
+export async function parseMultipartForm(bytes: Uint8Array, contentType: string): Promise<MultipartForm> {
+  const media = parseMultipartContentType(contentType);
+  if (!media || !media.mediaType.startsWith("multipart/")) throw new StatusError(400, "request Content-Type isn't multipart/form-data", { requestScoped: true });
+  if (media.boundary === "") throw new StatusError(400, "no multipart boundary param in Content-Type", { requestScoped: true });
   try {
-    return await new Response(bytes, { headers: { "Content-Type": contentType } }).formData();
+    return parseMultipartBytes(bytes, media.boundary);
   } catch (err) {
     throw new StatusError(400, `read multipart form failed: ${err instanceof Error ? err.message : String(err)}`, { requestScoped: true });
   }
 }
 
-/** Serialises a FormData into multipart bytes plus its Content-Type (Go: multipart.Writer). */
-export async function encodeMultipartForm(form: FormData): Promise<{ bytes: Uint8Array; contentType: string }> {
-  const response = new Response(form);
-  const contentType = response.headers.get("Content-Type") ?? "multipart/form-data";
-  return { bytes: new Uint8Array(await response.arrayBuffer()), contentType };
+/** Go: multipart escapeQuotes. */
+function escapeQuotes(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-function isFileEntry(value: FormDataEntryValue): value is File {
-  return typeof value !== "string";
+/** Serialises parts as multipart/form-data (Go: multipart.Writer WriteField / CreatePart). */
+export function encodeMultipart(parts: ReadonlyArray<{ name: string; value: MultipartValue }>, boundary = randomBoundary()): { bytes: Uint8Array; contentType: string } {
+  const encoder = new TextEncoder();
+  const chunks: Uint8Array[] = [];
+  for (const part of parts) {
+    let head = `--${boundary}\r\nContent-Disposition: form-data; name="${escapeQuotes(part.name)}"`;
+    if (isUploadedFile(part.value)) {
+      head += `; filename="${escapeQuotes(part.value.name)}"\r\nContent-Type: ${part.value.type.trim() !== "" ? part.value.type : "application/octet-stream"}`;
+      chunks.push(encoder.encode(head + "\r\n\r\n"), part.value.data, encoder.encode("\r\n"));
+    } else {
+      chunks.push(encoder.encode(head + "\r\n\r\n" + part.value + "\r\n"));
+    }
+  }
+  chunks.push(encoder.encode(`--${boundary}--\r\n`));
+  let size = 0;
+  for (const chunk of chunks) size += chunk.length;
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return { bytes, contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+function randomBoundary(): string {
+  const random = new Uint8Array(30);
+  crypto.getRandomValues(random);
+  return Array.from(random, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /**
@@ -110,25 +276,20 @@ function isFileEntry(value: FormDataEntryValue): value is File {
  * names and content types (application/octet-stream when missing)
  * (Go: rewriteOpenAICompatImagesMultipartPayload / buildOpenAICompatImagesMultipartRequest).
  */
-export async function rewriteOpenAICompatImagesMultipartForm(form: FormData, model: string, stream: boolean): Promise<{ bytes: Uint8Array; contentType: string }> {
-  const out = new FormData();
-  if (model !== "") out.append("model", model);
-  if (stream) out.append("stream", "true");
-  const files: Array<[string, File]> = [];
+export function rewriteOpenAICompatImagesMultipartForm(form: MultipartForm, model: string, stream: boolean): { bytes: Uint8Array; contentType: string } {
+  const out: Array<{ name: string; value: MultipartValue }> = [];
+  if (model !== "") out.push({ name: "model", value: model });
+  if (stream) out.push({ name: "stream", value: "true" });
+  const files: Array<{ name: string; value: UploadedFile }> = [];
   for (const [key, value] of form.entries()) {
-    if (isFileEntry(value)) {
-      files.push([key, value]);
+    if (isUploadedFile(value)) {
+      files.push({ name: key, value });
       continue;
     }
     if (key === "model" || key === "stream") continue;
-    out.append(key, value);
+    out.push({ name: key, value });
   }
-  for (const [key, file] of files) {
-    const type = file.type.trim() !== "" ? file.type : "application/octet-stream";
-    const blob = new Blob([await file.arrayBuffer()], { type });
-    out.append(key, blob, file.name || "file");
-  }
-  return encodeMultipartForm(out);
+  return encodeMultipart([...out, ...files]);
 }
 
 export interface PreparedImagesPayload {
@@ -172,7 +333,7 @@ export async function prepareOpenAICompatImagesPayload(payload: string, model: s
   if (!media || !media.mediaType.startsWith("multipart/")) return { body: payload, binary: true, contentType };
   if (media.boundary === "") throw new StatusError(400, "multipart boundary is missing", { requestScoped: true });
   const form = await parseMultipartForm(binaryStringToBytes(payload), contentType);
-  const rewritten = await rewriteOpenAICompatImagesMultipartForm(form, model, stream);
+  const rewritten = rewriteOpenAICompatImagesMultipartForm(form, model, stream);
   return { body: bytesToBinaryString(rewritten.bytes), binary: true, contentType: rewritten.contentType };
 }
 

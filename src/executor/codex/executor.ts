@@ -24,9 +24,13 @@
 // reasoning of earlier turns of the same session re-inserted from the cache,
 // which is filled from response.completed and cleared on an invalid signature.
 //
+// Image generation: requests from /v1/images/* (source format "openai-image")
+// are served by images.ts. Other requests get the hosted image_generation tool
+// declared (ensureImageGenerationTool) unless options.disableImageGeneration is
+// set, in which case any image_generation tool / tool_choice is stripped.
+//
 // Not ported (outside this slice): SIWC credentials and body rules, zstd request
-// compression, websockets transport, image endpoints and the image_generation
-// tool injection, /responses/compact, multi-agent v2 optimisation, prompt-cache keys (Session-Id), the payload
+// compression, websockets transport, /responses/compact, multi-agent v2 optimisation, prompt-cache keys (Session-Id), the payload
 // config finalizer, usage reporting and request logging, the Claude input-token
 // estimate on message_start, and the Home refresh/file-lock path.
 import type { Auth } from "../../auth/types.ts";
@@ -57,6 +61,7 @@ import {
   collectCodexOutputItemDone,
   collectedOutputItemCount,
   deleteFields,
+  ensureImageGenerationTool,
   ensureWebSearchToolForHistory,
   newCollectedOutputItems,
   normalizeCodexInstructions,
@@ -79,6 +84,7 @@ import { type CodexReasoningReplayCache, defaultCodexReasoningReplayCache } from
 import { asRequestError, applyRequestThinking, resolvedModelInfo } from "./thinking.ts";
 import { countCodexInputTokens } from "./tokens.ts";
 import { normalizeCodexToolSchemas } from "./tool_schema.ts";
+import { type CodexImagesContext, executeCodexOpenAIImage, executeCodexOpenAIImageStream, isCodexOpenAIImageRequest, stripImageGenerationTools } from "./images.ts";
 
 /** Injectable fetch for tests; defaults to the global fetch. */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -115,6 +121,11 @@ export interface CodexExecutorOptions {
   streamBootstrapTimeoutMs?: number;
   /** Reasoning replay store; defaults to the process-wide defaultCodexReasoningReplayCache. */
   reasoningReplayCache?: CodexReasoningReplayCache;
+  /**
+   * multimedia.disable-image-generation: never declare the image_generation
+   * tool and strip it (and a tool_choice forcing it) from outgoing requests.
+   */
+  disableImageGeneration?: boolean;
 }
 
 interface PreparedRequest {
@@ -185,11 +196,14 @@ export class CodexExecutor implements ProviderExecutor {
     }
     body = ensureWebSearchToolForHistory(body, opts.headers);
     body = normalizeCodexInstructions(body, preserveNativeOutput);
+    if (this.options.disableImageGeneration !== true) body = ensureImageGenerationTool(body, baseModel, auth, opts.headers);
     body = normalizeCodexParallelToolCalls(body, opts.headers);
     body = normalizeCodexToolSchemas(body);
     const replay = applyCodexReasoningReplayCache(this.replayCache, from, req, opts, body);
     body = replay.body;
     body = sanitizeCodexInputItemIDs(body);
+    // Go: the payload finalizer's disable-image-generation strip.
+    if (this.options.disableImageGeneration === true) body = stripImageGenerationTools(body);
 
     const url = baseURL.replace(/\/+$/, "") + "/responses";
     const headers = new Headers();
@@ -219,7 +233,13 @@ export class CodexExecutor implements ProviderExecutor {
     return newCodexStatusErrWithHeadersAndCooling(resp.status, resp.headers, body, this.modelLevelCooling, this.now());
   }
 
+  /** What the image endpoints borrow from this executor (images.ts). */
+  private imagesContext(): CodexImagesContext {
+    return { fetch: this.fetchFn, now: this.now, modelLevelCooling: this.modelLevelCooling, headerPolicy: { disableCloaking: this.options.disableCloaking, headerDefaults: this.options.headerDefaults } };
+  }
+
   async execute(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
+    if (isCodexOpenAIImageRequest(opts)) return executeCodexOpenAIImage(this.imagesContext(), auth, req, opts);
     const prepared = this.prepare(auth, req, opts, false);
     const resp = await this.send(auth, prepared, opts);
     if (resp.status < 200 || resp.status >= 300) throw await this.statusError(resp, prepared.replayScope);
@@ -261,6 +281,7 @@ export class CodexExecutor implements ProviderExecutor {
   }
 
   async executeStream(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<StreamResult> {
+    if (isCodexOpenAIImageRequest(opts)) return executeCodexOpenAIImageStream(this.imagesContext(), auth, req, opts);
     const prepared = this.prepare(auth, req, opts, true);
     const resp = await this.send(auth, prepared, opts);
     if (resp.status < 200 || resp.status >= 300) throw await this.statusError(resp, prepared.replayScope);
