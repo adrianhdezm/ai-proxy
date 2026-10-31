@@ -192,6 +192,8 @@ export interface ApiKeyCredential {
   excludedModels: string[];
   /** Claude keys on a non-Anthropic base URL: the gateway supports native tool search (native-tool-search). */
   nativeToolSearch?: boolean;
+  /** Codex keys: use the websocket transport for websocket clients (websockets). */
+  websockets?: boolean;
 }
 
 export type ClaudeApiKey = ApiKeyCredential;

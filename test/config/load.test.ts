@@ -401,3 +401,17 @@ claude-api-key:
   expect(auths[0]!.attributes.native_tool_search).toBe("true");
   expect(parseConfig("").client.codex.webSearchResultCache).toEqual({ enabled: false, ttlMs: 24 * 3_600_000, limit: 1024 });
 });
+
+test("codex-api-key websockets becomes the websockets auth attribute", () => {
+  const cfg = parseConfig(`
+codex-api-key:
+  - api-key: "c1"
+    websockets: true
+  - api-key: "c2"
+`);
+  expect(cfg.codexApiKeys.map((k) => k.websockets)).toEqual([true, undefined]);
+  const auths = synthesizeApiKeyAuths(cfg);
+  const byKey = (k: string) => auths.find((a) => a.attributes.api_key === k)!;
+  expect(byKey("c1").attributes.websockets).toBe("true");
+  expect(byKey("c2").attributes.websockets).toBeUndefined();
+});

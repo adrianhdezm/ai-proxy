@@ -11,8 +11,8 @@
 // handler and reach the executors with sourceFormat "openai-response"; the
 // executors translate to their upstream and back to Responses.
 //
-// Dropped from upstream: the websocket transport (GET /v1/responses), the
-// /backend-api/codex aliases, Codex multi-agent v2 tool preparation and orphan
+// The websocket transport (GET /v1/responses) lives in responses_websocket.ts.
+// Dropped from upstream: the /backend-api/codex aliases, Codex multi-agent v2 tool preparation and orphan
 // delegation rewriting, pre-first-token keep-alives, plugin routes, Home mode,
 // the Codex client model catalogue for ?client_version= (the plain OpenAI list
 // is returned) and the API_RESPONSE request-log hooks (diagnostics go to the

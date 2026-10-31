@@ -101,6 +101,7 @@ function synthesizeFamily(family: Family, now: number, idGen: StableIDGenerator)
     if (base !== "") attrs[AttributeBaseURL] = base;
     if (entry.priority !== 0) attrs[AttributePriority] = String(entry.priority);
     if (entry.nativeToolSearch === true) attrs.native_tool_search = "true";
+    if (entry.websockets === true) attrs.websockets = "true";
     addWeightToAttrs(entry.weight, attrs);
     const modelsHash = computeModelsHash(entry.models);
     if (modelsHash !== "") attrs.models_hash = modelsHash;

@@ -339,6 +339,9 @@ function parseCredentialList(raw: unknown, family: string, warn: (m: string) => 
     if (item["request-retry"] !== undefined && item["request-retry"] !== null) {
       entry.requestRetry = int(item["request-retry"], `${path}.request-retry`, 0);
     }
+    if (item.websockets !== undefined && item.websockets !== null) {
+      entry.websockets = bool(item.websockets, `${path}.websockets`, false);
+    }
     if (item["native-tool-search"] !== undefined && item["native-tool-search"] !== null) {
       entry.nativeToolSearch = bool(item["native-tool-search"], `${path}.native-tool-search`, false);
     }

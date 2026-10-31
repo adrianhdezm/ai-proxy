@@ -188,6 +188,7 @@ logging-level: "info"         # debug | info | warn | error
 #   - api-key: "sk-..."
 #     base-url: "https://codex.example.com"
 #     prefix: "codex"
+#     websockets: true   # websocket clients of /v1/responses use the Codex websocket upstream
 
 # Google AI Studio API keys (provider "aistudio",
 # default base-url https://generativelanguage.googleapis.com).

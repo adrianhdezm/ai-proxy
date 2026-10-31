@@ -117,6 +117,8 @@ These follow upstream and are off by default; see `config.example.yaml`.
 | `observability.usage.usage-statistics-enabled` | Records per-request usage, readable at `GET /v0/usage`. |
 | `multimedia.disable-image-generation` | Turns the image endpoints off and keeps the `image_generation` tool out of Codex requests. |
 
+**Websockets.** Codex clients can open a websocket on `GET /v1/responses` and keep a multi-turn session on it. When a Codex credential sets `websockets: true` (on its `codex-api-key` entry or in its auth file), websocket clients also reach the Codex backend over one reused upstream websocket. HTTP clients always use HTTP. Duplex response steering is not implemented.
+
 Always on, as upstream: Codex reasoning replay, Claude thinking replay (API keys on compat models), and the Claude Code request disguise on OAuth credentials for non-Claude-Code callers (signed billing header, diagnostics, context management). `upstream.claude.disable-claude-cloak-mode` turns the disguise off.
 
 ## Development
