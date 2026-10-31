@@ -131,6 +131,17 @@ export function getValue(body: string, path: string): unknown {
   return getAt(tryParse(body), path);
 }
 
+/**
+ * A well-formed GPT reasoning encrypted_content (Fernet-shaped: version 0x80,
+ * 8-byte timestamp, 16-byte IV, one AES block, 32-byte HMAC) (Go: validCodexReasoningEncryptedContentForTest).
+ */
+export function validCodexReasoningEncryptedContentForTest(): string {
+  const payload = new Uint8Array(1 + 8 + 16 + 16 + 32);
+  payload[0] = 0x80;
+  for (let i = 9; i < payload.length; i++) payload[i] = i;
+  return Buffer.from(payload).toString("base64url");
+}
+
 /** JSON.parse validity (Go: json.Valid). */
 export function jsonValid(text: string): boolean {
   try {

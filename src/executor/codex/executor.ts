@@ -43,10 +43,15 @@
 // the registered "codex" executor is websockets/auto.ts CodexAutoExecutor, which
 // picks it only for downstream websocket turns on websocket-enabled credentials.
 //
+// Reasoning items are sanitised before sending (reasoning_sanitize.ts: invalid
+// encrypted_content dropped, cleartext reasoning content cleared unless the model
+// is is-compat) and the prompt cache identity is set (prompt_cache.ts: body
+// prompt_cache_key + Session-Id header).
+//
 // Not ported (outside this slice): SIWC credentials and body rules, zstd request
-// compression, multi-agent v2 optimisation, prompt-cache keys (Session-Id), the payload
-// config finalizer, usage reporting and request logging, the Claude input-token
-// estimate on message_start, and the Home refresh/file-lock path.
+// compression, multi-agent v2 optimisation, the payload config finalizer, usage
+// reporting and request logging, the Claude input-token estimate on
+// message_start, and the Home refresh/file-lock path.
 import type { Auth } from "../../auth/types.ts";
 import { CodexAuthenticator } from "../../auth/codex/index.ts";
 import { FormatCodex, FormatOpenAIResponse, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
@@ -59,6 +64,7 @@ import { getAt, gstr, isObj } from "../../util/gpath.ts";
 import { tryParse } from "../../util/json.ts";
 import { log } from "../../log.ts";
 import { type ExecOptions, type ExecRequest, type ExecResponse, type ProviderExecutor, type StreamResult, StatusError, responseFormatOrSource } from "../types.ts";
+import { applyFetchProxy } from "../proxy.ts";
 import { codexAuthUsesAPIKey, codexBaseURL, codexCreds, isNativeCodexRequest } from "./creds.ts";
 import {
   type TerminalFailure,
@@ -101,6 +107,8 @@ import { type CodexReasoningReplayCache, defaultCodexReasoningReplayCache } from
 import { asRequestError, applyRequestThinking, resolvedModelInfo } from "./thinking.ts";
 import { countCodexInputTokens } from "./tokens.ts";
 import { normalizeCodexToolSchemas } from "./tool_schema.ts";
+import { type CodexModelOptionsResolver, resolveCodexModelIsCompat, resolveResponsesSignatureTargetModel, sanitizeResponsesReasoningEncryptedContent } from "./reasoning_sanitize.ts";
+import { applyCodexHTTPPromptCache } from "./prompt_cache.ts";
 import { type CodexImagesContext, executeCodexOpenAIImage, executeCodexOpenAIImageStream, isCodexOpenAIImageRequest, stripImageGenerationTools } from "./images.ts";
 
 /** Injectable fetch for tests; defaults to the global fetch. */
@@ -146,6 +154,12 @@ export interface CodexExecutorOptions {
    * tool and strip it (and a tool_choice forcing it) from outgoing requests.
    */
   disableImageGeneration?: boolean;
+  /**
+   * The configured models (name / alias / is-compat) of the credential serving a
+   * request (Go: resolveCodexConfig(auth).Models). Decides compat handling when
+   * no model definition is bound to the request.
+   */
+  modelOptionsFor?: CodexModelOptionsResolver;
 }
 
 interface PreparedRequest {
@@ -181,6 +195,11 @@ export class CodexExecutor implements ProviderExecutor {
     return this.options.modelLevelCooling === true;
   }
 
+  /** Go: resolveCodexModelIsCompat. */
+  isCompat(auth: Auth, req: ExecRequest, baseModel: string): boolean {
+    return resolveCodexModelIsCompat(auth, req, baseModel, this.options.modelOptionsFor);
+  }
+
   /** Builds the translated upstream request (Go: the shared head of Execute / ExecuteStream). */
   prepare(auth: Auth, req: ExecRequest, opts: ExecOptions, stream: boolean): PreparedRequest {
     const baseModel = parseSuffix(req.model).modelName;
@@ -191,7 +210,8 @@ export class CodexExecutor implements ProviderExecutor {
     const responseFormat = responseFormatOrSource(opts);
     const to = FormatCodex;
     const originalPayload = opts.originalRequest && opts.originalRequest.length > 0 ? opts.originalRequest : req.payload;
-    const isCompat = resolvedModelInfo(req)?.isCompat === true;
+    const isCompat = this.isCompat(auth, req, baseModel);
+    const targetModel = resolveResponsesSignatureTargetModel(baseModel, req, opts);
     const preserveNativeOutput = isNativeCodexRequest(req.payload, from, responseFormat, opts.headers);
 
     let body: string;
@@ -221,12 +241,16 @@ export class CodexExecutor implements ProviderExecutor {
     body = normalizeCodexToolSchemas(body);
     const replay = applyCodexReasoningReplayCache(this.replayCache, from, req, opts, body);
     body = replay.body;
-    body = sanitizeCodexInputItemIDs(body);
+    body = sanitizeResponsesReasoningEncryptedContent("codex executor", body, isCompat, targetModel, baseURL);
+    // Go: cacheHelper (prompt_cache_key + Session-Id, input id sanitising, payload finalizer).
+    const cache = applyCodexHTTPPromptCache(from, req, body, opts.headers, opts.metadata);
+    body = sanitizeCodexInputItemIDs(cache.body);
     // Go: the payload finalizer's disable-image-generation strip.
     if (this.options.disableImageGeneration === true) body = stripImageGenerationTools(body);
 
     const url = baseURL.replace(/\/+$/, "") + "/responses";
     const headers = new Headers();
+    if (cache.sessionID !== "") headers.set("Session-Id", cache.sessionID);
     applyCodexHeaders(headers, auth, apiKey, true, { disableCloaking: this.options.disableCloaking, headerDefaults: this.options.headerDefaults }, opts.headers);
     applyCodexRoutingHint(headers, auth, baseModel, body, opts.headers);
     applyModelHeaderOverrides(headers, baseModel);
@@ -235,8 +259,7 @@ export class CodexExecutor implements ProviderExecutor {
 
   private async send(auth: Auth, prepared: PreparedRequest, opts: ExecOptions): Promise<Response> {
     const init: RequestInit & { proxy?: string } = { method: "POST", headers: prepared.headers, body: prepared.body, signal: opts.signal };
-    const proxy = (opts.proxyUrl ?? auth.proxyUrl ?? "").trim();
-    if (proxy !== "") init.proxy = proxy;
+    applyFetchProxy(init, opts.proxyUrl, auth.proxyUrl, undefined);
     return this.fetchFn(prepared.url, init);
   }
 
@@ -460,7 +483,7 @@ export class CodexExecutor implements ProviderExecutor {
     const responseFormat = responseFormatOrSource(opts);
     const to = FormatOpenAIResponse;
     const originalPayload = opts.originalRequest && opts.originalRequest.length > 0 ? opts.originalRequest : req.payload;
-    const isCompat = resolvedModelInfo(req)?.isCompat === true;
+    const isCompat = this.isCompat(auth, req, baseModel);
     let body: string;
     try {
       body = translateCodexRequestPair(from, to, baseModel, originalPayload, req.payload, false, isCompat).body;
@@ -472,12 +495,15 @@ export class CodexExecutor implements ProviderExecutor {
     body = deleteFields(body, "stream");
     body = normalizeCodexInstructions(body, isNativeCodexRequest(req.payload, from, responseFormat, opts.headers));
     body = ensureWebSearchToolForHistory(body, opts.headers);
+    body = sanitizeResponsesReasoningEncryptedContent("codex executor", body, isCompat, resolveResponsesSignatureTargetModel(baseModel, req, opts), baseURL);
     body = normalizeCodexParallelToolCalls(body, opts.headers);
     body = normalizeCodexToolSchemas(body);
-    body = sanitizeCodexInputItemIDs(body);
+    const cache = applyCodexHTTPPromptCache(from, req, body, opts.headers, opts.metadata);
+    body = sanitizeCodexInputItemIDs(cache.body);
 
     const url = baseURL.replace(/\/+$/, "") + "/responses/compact";
     const headers = new Headers();
+    if (cache.sessionID !== "") headers.set("Session-Id", cache.sessionID);
     applyCodexHeaders(headers, auth, apiKey, false, { disableCloaking: this.options.disableCloaking, headerDefaults: this.options.headerDefaults }, opts.headers);
     applyCodexRoutingHint(headers, auth, baseModel, body, opts.headers);
     applyModelHeaderOverrides(headers, baseModel);
@@ -508,6 +534,14 @@ export class CodexExecutor implements ProviderExecutor {
    * responses are `{"input_tokens":N}`.
    */
   async countTokens(_auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
+    const body = this.countTokensBody(req, opts);
+    const count = countCodexInputTokens(body);
+    const usageJSON = JSON.stringify({ response: { usage: { input_tokens: count, output_tokens: 0, total_tokens: count } } });
+    return { payload: defaultRegistry.translateTokenCount({ signal: opts.signal }, FormatCodex, responseFormatOrSource(opts), count, usageJSON) };
+  }
+
+  /** The translated Codex body countTokens estimates (Go: the head of CountTokens). */
+  countTokensBody(req: ExecRequest, opts: ExecOptions): string {
     const baseModel = parseSuffix(req.model).modelName;
     const from = opts.sourceFormat;
     const responseFormat = responseFormatOrSource(opts);
@@ -522,10 +556,7 @@ export class CodexExecutor implements ProviderExecutor {
     body = setStringIfDifferent(body, "model", baseModel);
     body = deleteFields(body, "previous_response_id", "generate", "prompt_cache_retention", "safety_identifier", "stream_options");
     body = setBoolIfDifferent(body, "stream", false);
-    body = normalizeCodexInstructions(body, isNativeCodexRequest(req.payload, from, responseFormat, opts.headers));
-    const count = countCodexInputTokens(body);
-    const usageJSON = JSON.stringify({ response: { usage: { input_tokens: count, output_tokens: 0, total_tokens: count } } });
-    return { payload: defaultRegistry.translateTokenCount({ signal: opts.signal }, FormatCodex, responseFormat, count, usageJSON) };
+    return normalizeCodexInstructions(body, isNativeCodexRequest(req.payload, from, responseFormat, opts.headers));
   }
 
   /**

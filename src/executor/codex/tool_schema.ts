@@ -6,7 +6,7 @@
 // unchanged payload is returned as the same string).
 //
 // NormalizeCodexToolIntegerTypes (Codex client number->integer rewrite for
-// non-Codex targets) is not part of this executor and is not ported.
+// non-Codex targets) lives in tool_schema_integer.ts; the Codex executor never applies it.
 import { hasUnsupportedUnicodePropertyEscape, schemaMapKeywords, schemaValueKeywords } from "../../util/claude_schema.ts";
 import { log } from "../../log.ts";
 import { RawNumber, isRawNumber, parseRawJSON, stringifyRawJSON } from "./rawjson.ts";

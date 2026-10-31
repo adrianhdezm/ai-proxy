@@ -75,7 +75,7 @@ import {
   translateCodexRequestPair,
 } from "../request.ts";
 import { utf8Len } from "../sse_scanner.ts";
-import { asRequestError, applyRequestThinking, resolvedModelInfo } from "../thinking.ts";
+import { asRequestError, applyRequestThinking } from "../thinking.ts";
 import { normalizeCodexToolSchemas } from "../tool_schema.ts";
 import {
   CodexWebsocketCloseError,
@@ -104,6 +104,7 @@ import {
   websocketInputLossError,
 } from "./context.ts";
 import { clearCodexReasoningReplayOnWebsocketError, encodeCodexWebsocketAsSSE, normalizeCodexWebsocketCompletion, parseCodexWebsocketErrorWithCooling } from "./errors.ts";
+import { resolveResponsesSignatureTargetModel, sanitizeResponsesReasoningEncryptedContent } from "../reasoning_sanitize.ts";
 import { applyCodexPromptCacheHeaders, applyCodexWebsocketHeaders, buildCodexResponsesWebsocketURL, frameCodexWebsocketRequestBody, normalizeCodexWebsocketParallelToolCalls } from "./request.ts";
 import {
   type CodexWebsocketRead,
@@ -204,7 +205,8 @@ export class CodexWebsocketsExecutor implements ProviderExecutor, ExecutionSessi
     const responseFormat = responseFormatOrSource(opts);
     const preserveNativeOutput = isNativeCodexRequest(req.payload, from, responseFormat, opts.headers);
     const originalPayload = opts.originalRequest && opts.originalRequest.length > 0 ? opts.originalRequest : req.payload;
-    const isCompat = resolvedModelInfo(req)?.isCompat === true;
+    const isCompat = this.http.isCompat(auth, req, baseModel);
+    const targetModel = resolveResponsesSignatureTargetModel(baseModel, req, opts);
     let body: string;
     try {
       body = translateCodexRequestPair(from, FormatCodex, baseModel, originalPayload, req.payload, stream, isCompat).body;
@@ -225,8 +227,9 @@ export class CodexWebsocketsExecutor implements ProviderExecutor, ExecutionSessi
     body = normalizeCodexToolSchemas(body);
     const replay = applyCodexReasoningReplayCache(this.replayCache, from, req, opts, body);
     body = replay.body;
+    body = sanitizeResponsesReasoningEncryptedContent("codex websockets executor", body, isCompat, targetModel, baseURL);
     const wsURL = buildCodexResponsesWebsocketURL(baseURL.replace(/\/+$/, "") + "/responses");
-    const cached = applyCodexPromptCacheHeaders(from, req, body);
+    const cached = applyCodexPromptCacheHeaders(from, req, body, opts.headers, opts.metadata);
     body = sanitizeCodexInputItemIDs(cached.body);
     if (this.options.disableImageGeneration === true) body = stripImageGenerationTools(body);
     const headers = applyCodexWebsocketHeaders(cached.headers, auth, apiKey, this.headerPolicy, preserveNativeOutput, opts.headers);

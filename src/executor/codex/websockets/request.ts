@@ -8,35 +8,32 @@
 // wire; Headers (and Bun's websocket client) lower-case names, so only the
 // values are kept.
 //
-// Not ported: the SIWC header branch, the Claude / derived-session prompt-cache
-// keys (helps.ClaudeCodePromptCache, ProviderSessionUUID; the HTTP executor of
-// this port does not set them either).
+// Not ported: the SIWC header branch. The prompt cache id itself comes from
+// ../prompt_cache.ts (shared with the HTTP transport).
 import type { Auth } from "../../../auth/types.ts";
-import { FormatOpenAIResponse, type Format } from "../../../translator/types.ts";
+import type { Format } from "../../../translator/types.ts";
 import { applyCustomHeadersFromAttrs } from "../../../util/header_helpers.ts";
-import { getAt, gstr, isObj } from "../../../util/gpath.ts";
+import { gstr, isObj } from "../../../util/gpath.ts";
 import { tryParse } from "../../../util/json.ts";
 import type { ExecRequest } from "../../types.ts";
 import { codexAuthUsesAPIKey, codexResponsesLiteHeader, headerValueCaseInsensitive, isCodexResponsesLiteRequest } from "../creds.ts";
 import { type CodexHeaderPolicy, applyCodexCloakingHeaders, codexHeaderDefaults, codexOriginator, codexSessionHeaderValue, codexUserAgent, ensureHeader, ensureHeaderWithConfigPrecedence, isCodexCloakingDisabled } from "../headers.ts";
 import { setBoolIfDifferent, setStringIfDifferent } from "../request.ts";
+import { codexPromptCacheID } from "../prompt_cache.ts";
 
 /** OpenAI-Beta value selecting the Responses websocket protocol (Go: codexResponsesWebsocketBetaHeaderValue). */
 export const codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06";
 
 /**
- * Sets prompt_cache_key and the session headers for a Responses request that
- * carries prompt_cache_key (Go: applyCodexPromptCacheHeadersWithContext,
- * openai-response branch). Returns the body and the initial websocket headers.
+ * Sets prompt_cache_key and the session headers (Go: applyCodexPromptCacheHeadersWithContext):
+ * the Claude Code session cache id for Claude inbound, the client's
+ * prompt_cache_key for Responses inbound, else the execution / derived session
+ * UUID. Returns the body and the initial websocket headers.
  */
-export function applyCodexPromptCacheHeaders(from: Format, req: ExecRequest, body: string): { body: string; headers: Headers } {
+export function applyCodexPromptCacheHeaders(from: Format, req: ExecRequest, body: string, clientHeaders?: Headers, optsMetadata?: Record<string, unknown>): { body: string; headers: Headers } {
   const headers = new Headers();
   if (body.length === 0) return { body, headers };
-  let cacheID = "";
-  if (from === FormatOpenAIResponse) {
-    const key = getAt(tryParse(req.payload), "prompt_cache_key");
-    if (key !== undefined && key !== null) cacheID = typeof key === "string" ? key : JSON.stringify(key);
-  }
+  const cacheID = codexPromptCacheID(from, req, body, clientHeaders, optsMetadata);
   if (cacheID !== "") {
     body = setStringIfDifferent(body, "prompt_cache_key", cacheID);
     headers.set("session_id", cacheID);

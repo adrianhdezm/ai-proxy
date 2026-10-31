@@ -1,7 +1,7 @@
 // Ported from: internal/runtime/executor/helps/codex_tool_schema_test.go
 // Ported from: internal/runtime/executor/codex_executor_tool_schema_test.go
-// Skipped cases: TestNormalizeCodexToolIntegerTypes_CodexClientToolFieldTypes (NormalizeCodexToolIntegerTypes is
-//   not ported: it rewrites Codex-client tools for non-Codex targets), TestCodexExecutor_DoesNotNormalizeToolIntegerTypesForCodexUserAgent,
+// Skipped cases: TestNormalizeCodexToolIntegerTypes_CodexClientToolFieldTypes (same fixture and assertions as
+//   internal/client/codex/tool-schema TestNormalizeCodexToolIntegerTypes, ported in tool_schema_integer.test.ts), TestCodexExecutor_DoesNotNormalizeToolIntegerTypesForCodexUserAgent,
 //   TestCodexWebsocketsExecutor_* (websockets not ported), TestOpenAICompatExecutor_NormalizesToolIntegerTypesForCodexUserAgent_NonCodexTarget
 //   (another executor), TestCodexExecutorExecuteStream_BufferingPartialDeltasIncompleteResponseIsSuccessful (bootstrap
 //   buffering not ported). The executor cases send Claude Messages requests (Go used OpenAI chat requests).

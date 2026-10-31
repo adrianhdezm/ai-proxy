@@ -10,7 +10,7 @@ import type { ProviderExecutor } from "./types.ts";
 import { createClaudeExecutor } from "./claude/index.ts";
 import type { ClaudeWebSearchResultCacheConfig } from "./claude/web_search_results.ts";
 import { setClientToolSearchEnabled } from "../translator/claude/openai/responses/index.ts";
-import { createCodexAutoExecutor } from "./codex/index.ts";
+import { codexModelOptionsFromConfig, createCodexAutoExecutor } from "./codex/index.ts";
 import { createAIStudioExecutor, createGeminiCLIExecutor } from "./gemini/index.ts";
 import { createOpenAIExecutor } from "./openai/index.ts";
 
@@ -55,6 +55,7 @@ export function createExecutors(config: Config): ProviderExecutor[] {
       ...(webSearchResultCache ? { webSearchResultCache } : {}),
       modelLevelCooling: config.upstream.claude.modelLevelCooling,
       sessionDatePinDays: config.upstream.claude.sessionDatePinDays,
+      ...(config.upstream.claude.headerDefaults ? { headerDefaults: config.upstream.claude.headerDefaults } : {}),
       ...(config.upstream.claude.disableCloakMode ? { cloakMode: "never" as const } : {}),
     }),
     // Go: NewCodexAutoExecutor — HTTP/SSE, or the Responses websocket for downstream
@@ -65,6 +66,7 @@ export function createExecutors(config: Config): ProviderExecutor[] {
       streamBootstrapBuffering: config.upstream.codex.streamBootstrapBuffering,
       streamBootstrapTimeoutMs: config.upstream.codex.streamBootstrapTimeoutMs,
       disableImageGeneration: config.multimedia.disableImageGeneration,
+      modelOptionsFor: codexModelOptionsFromConfig(config),
     }),
     createGeminiCLIExecutor({ proxyUrl, switchPreviewModel: config.quotaExceeded.switchPreviewModel }),
     createAIStudioExecutor({ proxyUrl }),

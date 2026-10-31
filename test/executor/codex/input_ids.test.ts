@@ -6,7 +6,7 @@
 //   unchanged (no openai-response translator is registered in this port).
 import { afterAll, describe, expect, test } from "bun:test";
 import { CodexExecutor, codexInputItemIDLimit, sanitizeCodexInputItemIDs, shortenCodexInputItemID } from "../../../src/executor/codex/index.ts";
-import { apiKeyAuth, drain, getString, getValue, options, request, sseResponse, startUpstream } from "./helpers.ts";
+import { apiKeyAuth, drain, getString, getValue, options, request, sseResponse, startUpstream, validCodexReasoningEncryptedContentForTest } from "./helpers.ts";
 
 const runes = (s: string) => Array.from(s).length;
 
@@ -181,7 +181,7 @@ describe("TestCodexExecutorExecuteStreamSanitizesOverlongInputItemIDs", () => {
     const longOutputItemID = "grok-output-item-".repeat(6);
     const payload =
       `{"model":"gpt-5.4","stream":true,"input":[` +
-      `{"type":"reasoning","id":"${longReasoningItemID}","encrypted_content":"gAAAAencrypted","summary":[]},` +
+      `{"type":"reasoning","id":"${longReasoningItemID}","encrypted_content":"${validCodexReasoningEncryptedContentForTest()}","summary":[]},` +
       `{"type":"function_call","id":"${longCallItemID}","call_id":"call-1","name":"lookup","arguments":"{}"},` +
       `{"type":"function_call_output","id":"${longOutputItemID}","call_id":"call-1","output":"ok"},` +
       `{"type":"message","id":"item_74ec40c883248ebb4885ec84","role":"user","content":"continue"}]}`;

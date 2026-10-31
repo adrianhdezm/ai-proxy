@@ -1,0 +1,11 @@
+{
+  "internal/runtime/executor/codex_executor_compression_review_test.go": "Tests zstd upstream request compression and its Content-Encoding fallback, which the Codex executor port does not implement.",
+  "internal/runtime/executor/codex_executor_compression_test.go": "Tests zstd upstream request compression (codex.upstream-request-compression) and compressed response decoding, which the Codex executor port does not implement.",
+  "internal/runtime/executor/codex_executor_execute_usage_test.go": "Tests the executor-side usage reporter publishing image_gen tool_usage as a separate record and payload-override reasoning effort; this port records usage in the server (src/usage) and has neither tool_usage records nor payload override rules.",
+  "internal/runtime/executor/codex_executor_search_test.go": "Tests the alpha/search passthrough of dual-partition SIWC credentials through AuthManager.HttpRequest; SIWC credentials are not ported.",
+  "internal/runtime/executor/codex_executor_spawn_agent_test.go": "Tests the Codex multi-agent v2 request optimisation (spawn_agent / agent_message rewriting), which is not ported.",
+  "internal/runtime/executor/codex_response_model_test.go": "Tests observeCodexTokenEvent feeding the executor usage reporter and the separate image-generation usage record; this port records the response model in the server-side usage recorder and has no executor usage reporter or per-tool usage records.",
+  "internal/runtime/executor/helps/payload_helpers_codex_integer_test.go": "Tests ApplyPayloadConfigWithTrackedPathsForExecutor (payload config rules, not ported) choosing integer normalisation by target executor; the normalisation itself is ported and tested in test/executor/codex/tool_schema_integer.test.ts.",
+  "internal/client/codex/models/models_test.go": "Tests the Codex client model catalogue served for /v1/models?client_version= (templates, reasoning levels, search-tool capabilities), which the server port deliberately does not build (it returns the plain OpenAI model list).",
+  "internal/client/codex/optimize-multi-agent-v2/orphan_delegation_test.go": "Tests Codex multi-agent v2 orphan delegation rewriting, which is not ported."
+}
