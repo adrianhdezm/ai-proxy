@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, expandHome, loadConfig, parseConfig, resolveAuthDir } from "../../src/config/load.ts";
+import { synthesizeApiKeyAuths } from "../../src/config/auths.ts";
 import { DefaultCodexBaseURL, DefaultOpenAIBaseURL } from "../../src/config/types.ts";
 
 const cleanups: (() => void)[] = [];
@@ -379,4 +380,24 @@ multimedia:
   expect(defaults.upstream.codex.streamBootstrapBuffering).toBe(false);
   expect(defaults.upstream.codex.streamBootstrapTimeoutMs).toBe(0);
   expect(() => parseConfig(`upstream:\n  codex:\n    stream-bootstrap-timeout: "soon"\n`)).toThrow();
+});
+
+test("client.codex.web-search-result-cache and claude-api-key native-tool-search", () => {
+  const cfg = parseConfig(`
+client:
+  codex:
+    web-search-result-cache:
+      enabled: true
+      ttl: "30m"
+      limit: 50
+claude-api-key:
+  - api-key: "k1"
+    base-url: "https://gateway.example.com"
+    native-tool-search: true
+`);
+  expect(cfg.client.codex.webSearchResultCache).toEqual({ enabled: true, ttlMs: 30 * 60_000, limit: 50 });
+  expect(cfg.claudeApiKeys[0]!.nativeToolSearch).toBe(true);
+  const auths = synthesizeApiKeyAuths(cfg);
+  expect(auths[0]!.attributes.native_tool_search).toBe("true");
+  expect(parseConfig("").client.codex.webSearchResultCache).toEqual({ enabled: false, ttlMs: 24 * 3_600_000, limit: 1024 });
 });

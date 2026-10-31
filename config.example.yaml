@@ -107,8 +107,20 @@ upstream:
     disable-claude-cloak-mode: false
     # Days to keep the cloaked currentDate pin per session (0 = 1h continuity pin).
     session-date-pin-days: 7
-    # Native tool search handling.
+    # Map Responses-client tool_search to Anthropic native tool search (defer_loading and
+    # tool_reference). Native on api.anthropic.com; on other base URLs set
+    # native-tool-search: true on the claude-api-key entry. Otherwise tool_search is stripped.
     tool-search: false
+
+# Client-facing compatibility settings.
+client:
+  codex:
+    # Cache upstream web search results per session so Responses clients that replay
+    # web_search_call items without their results still keep them in later turns.
+    web-search-result-cache:
+      enabled: false
+      ttl: "24h"
+      limit: 1024
 
 observability:
   usage:

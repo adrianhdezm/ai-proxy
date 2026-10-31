@@ -125,6 +125,16 @@ export interface ClaudeUpstreamConfig {
   toolSearch: boolean;
 }
 
+/** client.codex.web-search-result-cache */
+export interface WebSearchResultCacheConfig {
+  /** Cache upstream web search results per session (default false as upstream). */
+  enabled: boolean;
+  /** Entry lifetime in ms (default 24h). */
+  ttlMs: number;
+  /** Maximum cached entries (default 1024). */
+  limit: number;
+}
+
 /** observability.usage */
 export interface UsageConfig {
   /** In-memory usage aggregation (usage-statistics-enabled, default false). */
@@ -180,6 +190,8 @@ export interface ApiKeyCredential {
   requestRetry?: number;
   /** Lower-cased exclusion patterns ("*" wildcards). */
   excludedModels: string[];
+  /** Claude keys on a non-Anthropic base URL: the gateway supports native tool search (native-tool-search). */
+  nativeToolSearch?: boolean;
 }
 
 export type ClaudeApiKey = ApiKeyCredential;
@@ -197,6 +209,7 @@ export interface Config {
   upstream: { codex: CodexUpstreamConfig; claude: ClaudeUpstreamConfig };
   usage: UsageConfig;
   multimedia: MultimediaConfig;
+  client: { codex: { webSearchResultCache: WebSearchResultCacheConfig } };
   /** Debug mode: implies loggingLevel "debug" and verbose request logging. */
   debug: boolean;
   loggingLevel: LogLevel;

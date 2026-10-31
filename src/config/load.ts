@@ -62,6 +62,7 @@ export function defaultConfig(): Config {
     },
     usage: { statisticsEnabled: false },
     multimedia: { disableImageGeneration: false },
+    client: { codex: { webSearchResultCache: { enabled: false, ttlMs: 24 * 3_600_000, limit: 1024 } } },
     debug: false,
     loggingLevel: "info",
     claudeApiKeys: [],
@@ -215,6 +216,15 @@ export function parseConfig(text: string, options: LoadOptions = {}): Config {
   const multimedia = section(root, "multimedia");
   cfg.multimedia.disableImageGeneration = bool(multimedia["disable-image-generation"], "multimedia.disable-image-generation", false);
 
+  const client = section(root, "client");
+  const clientCodex = section(client, "codex");
+  const webSearch = section(clientCodex, "web-search-result-cache");
+  cfg.client.codex.webSearchResultCache = {
+    enabled: bool(webSearch.enabled, "client.codex.web-search-result-cache.enabled", false),
+    ttlMs: durationMs(webSearch.ttl, "client.codex.web-search-result-cache.ttl", 24 * 3_600_000) || 24 * 3_600_000,
+    limit: Math.max(1, int(webSearch.limit, "client.codex.web-search-result-cache.limit", 1024) || 1024),
+  };
+
   // ---- logging -------------------------------------------------------------
   cfg.debug = bool(root.debug, "debug", false);
   const level = str(root["logging-level"], "logging-level").toLowerCase();
@@ -249,6 +259,7 @@ const KnownTopLevelKeys = new Set([
   "upstream",
   "observability",
   "multimedia",
+  "client",
   "usage-statistics-enabled",
   "debug",
   "logging-level",
@@ -327,6 +338,9 @@ function parseCredentialList(raw: unknown, family: string, warn: (m: string) => 
     }
     if (item["request-retry"] !== undefined && item["request-retry"] !== null) {
       entry.requestRetry = int(item["request-retry"], `${path}.request-retry`, 0);
+    }
+    if (item["native-tool-search"] !== undefined && item["native-tool-search"] !== null) {
+      entry.nativeToolSearch = bool(item["native-tool-search"], `${path}.native-tool-search`, false);
     }
     out.push(entry);
   });

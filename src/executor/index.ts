@@ -31,7 +31,7 @@ interface WebSearchResultCacheSetting {
  * that adds the field (Config.client.codex.webSearchResultCache).
  */
 export function claudeWebSearchResultCacheConfigFrom(config: Config): ClaudeWebSearchResultCacheConfig | undefined {
-  const setting = (config as unknown as { client?: { codex?: { webSearchResultCache?: WebSearchResultCacheSetting } } }).client?.codex?.webSearchResultCache;
+  const setting: WebSearchResultCacheSetting | undefined = config.client?.codex?.webSearchResultCache;
   if (!setting?.enabled) return undefined;
   return { enabled: true, ttlMs: setting.ttlMs, limit: setting.limit };
 }
