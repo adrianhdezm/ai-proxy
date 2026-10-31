@@ -18,7 +18,7 @@ import { requestModelName as commonRequestModelName } from "../../../common/requ
 import { setResponsesToolCallIdentity } from "../../../common/responses.ts";
 import type { TranslateContext, TranslatorState } from "../../../types.ts";
 import { isVertexStreamingFunctionCall, type VertexStreamingToolCall, newVertexStreamingToolCall } from "../../common/vertex_partial_args.ts";
-import { gfloat, has, runeCount, str, unixNano, validJSON } from "./helpers.ts";
+import { gfloat, gjsonRaw, has, parseGJSON, runeCount, str, unixNano, validJSON } from "./helpers.ts";
 import { geminiResponsesThoughtSignature } from "./request.ts";
 import {
   encodeGeminiResponsesCarrier,
@@ -409,8 +409,9 @@ export function convertGeminiResponseToOpenAIResponses(
     if (st.finishReason === "") st.finishReason = "STOP";
     chunk = "{}";
   }
-  const chunkValid = validJSON(chunk);
-  let root = parse(chunk);
+  const parsedChunk = parseGJSON(chunk);
+  const chunkValid = parsedChunk.valid;
+  let root = parsedChunk.value;
   if (root === undefined) return [];
   root = unwrapGeminiResponseRoot(root);
   const hasUsage = st.usage.merge(root);
@@ -1458,8 +1459,7 @@ function identityFor(name: string): ResponsesToolIdentity {
 
 /** gjson fc.Get("args").Raw. */
 function rawOfArgs(fc: unknown): string {
-  const args = getAt(fc, "args");
-  return args === undefined ? "" : JSON.stringify(args);
+  return gjsonRaw(getAt(fc, "args"));
 }
 
 interface NonStreamReasoningOutput {
@@ -1478,8 +1478,9 @@ export function convertGeminiResponseToOpenAIResponsesNonStream(
   rawJSON: string,
   param: TranslatorState | undefined,
 ): string {
-  const rawValid = validJSON(rawJSON);
-  const root = unwrapGeminiResponseRoot(parse(rawJSON));
+  const parsedRaw = parseGJSON(rawJSON);
+  const rawValid = parsedRaw.valid;
+  const root = unwrapGeminiResponseRoot(parsedRaw.value);
   const reqJSON = pickRequestJSON(originalRequestRawJSON, requestRawJSON);
   const sanitizedNameMap = sanitizedToolNameMap(originalRequestRawJSON);
   const toolIdentityMap = responsesToolReverseIdentityMap(reqJSON);

@@ -1,7 +1,11 @@
 // Port of internal/translator/common (shared helpers for the Claude-inbound translators).
 //
-// Not ported: antigravity_tools, devin_tools, vertex_partial_args, apply_patch_* and
-// interactions_usage (they only serve translators that are out of scope).
+// Not ported: antigravity_tools, devin_tools, vertex_partial_args and interactions_usage
+// (they only serve translators that are out of scope).
+export * from "./apply_patch_events.ts";
+export * from "./apply_patch_input.ts";
+export * from "./apply_patch_responses.ts";
+export * from "./apply_patch_tool.ts";
 export * from "./bytes.ts";
 export * from "./cache_control.ts";
 export * from "./claude_messages.ts";

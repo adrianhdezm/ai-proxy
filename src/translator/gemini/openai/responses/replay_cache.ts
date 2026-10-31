@@ -23,6 +23,16 @@ export function setReplayCacheClock(fn: (() => number) | undefined): void {
   nowFn = fn ?? (() => Date.now());
 }
 
+let writeFilter: (() => boolean) | undefined;
+
+/**
+ * Installs a hook consulted before every write; returning false rejects the write
+ * (tests use it to stand in for Go's failing Home KV backend). Undefined removes it.
+ */
+export function setReplayCacheWriteFilter(fn: (() => boolean) | undefined): void {
+  writeFilter = fn;
+}
+
 /** Clears every cached entry (Go: ClearAntigravityReasoningReplayCache). */
 export function clearReplayCache(): void {
   entries.clear();
@@ -88,6 +98,7 @@ export function cacheReplayItems(modelName: string, sessionKey: string, items: s
   if (key === "") return false;
   const normalized = normalizeItems(items);
   if (!normalized) return false;
+  if (writeFilter && !writeFilter()) return false;
   const now = nowFn();
   purgeExpired(now);
   entries.delete(key);
