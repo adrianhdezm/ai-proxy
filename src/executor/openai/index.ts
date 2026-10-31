@@ -8,6 +8,12 @@
 // to `<base_url>/chat/completions` with a Bearer API key; responses and SSE
 // streams are translated back to the response format (Claude).
 //
+// OpenAI Responses requests (source format "openai-response" from /v1/responses)
+// go through the Responses -> chat completions translator; at the end of the
+// stream the translator state may synthesize the missing [DONE]
+// (CanFinalizeResponseStream) or reject an unfinished apply_patch call, and
+// every Responses chunk gets complete usage details (EnsureResponsesUsageDetails).
+//
 // Image requests (source format "openai-image" from /v1/images/*) are passed
 // through to `<base_url>/images/generations` or `/images/edits` (images.ts).
 //
@@ -18,9 +24,11 @@
 import type { Config, ModelOverride } from "../../config/types.ts";
 import { modelOverridesFor } from "../../config/auths.ts";
 import { type Auth, AttributeAPIKey, AttributeBaseURL } from "../../auth/types.ts";
-import { FormatClaude, FormatOpenAI, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
+import { FormatClaude, FormatOpenAI, FormatOpenAIResponse, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
 import { hasRequestTransformer, translateNonStream, translateRequest, translateTokenCount } from "../../translator/registry.ts";
 import { convertClaudeRequestToOpenAIWithCompat } from "../../translator/openai/claude/index.ts";
+import "../../translator/openai/openai/responses/index.ts";
+import { applyPatchTranslationError, applyPatchUpstreamError, canFinalizeResponseStream, ensureResponsesUsageDetails, finalizeApplyPatchStream, initializeApplyPatchStream } from "../responses.ts";
 import {
   SummaryUnspecified,
   type SummaryConfig,
@@ -306,8 +314,10 @@ export class OpenAICompatExecutor implements ProviderExecutor {
     }
     const state: TranslatorState = {};
     const ctx: TranslateContext = { signal: opts.signal };
-    const out = translateNonStream(ctx, FormatOpenAI, prepared.responseFormat, req.model, prepared.originalPayload, prepared.body, body, state);
+    let out = translateNonStream(ctx, FormatOpenAI, prepared.responseFormat, req.model, prepared.originalPayload, prepared.body, body, state);
+    if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
     if (out.length === 0) throw new StatusError(502, "upstream returned an unusable response", { body: "" });
+    if (prepared.responseFormat === FormatOpenAIResponse) out = ensureResponsesUsageDetails(out);
     const usage = parseOpenAIUsage(body);
     return { payload: out, headers: resp.headers, metadata: usage.present ? { usage } : undefined };
   }
@@ -331,8 +341,14 @@ export class OpenAICompatExecutor implements ProviderExecutor {
     const state: TranslatorState = {};
     const ctx: TranslateContext = { signal: opts.signal };
     const responseFormat = prepared.responseFormat;
-    const translate = (line: string): string[] =>
-      translateStreamWithClaudeInputTokens(ctx, FormatOpenAI, responseFormat, req.model, prepared.originalPayload, prepared.body, line, state, inputTokens);
+    const translate = (line: string): string[] => {
+      const chunks = translateStreamWithClaudeInputTokens(ctx, FormatOpenAI, responseFormat, req.model, prepared.originalPayload, prepared.body, line, state, inputTokens);
+      // Go: TranslateStreamWithClaudeInputTokens completes Responses usage details on every chunk.
+      if (responseFormat !== FormatOpenAIResponse || applyPatchTranslationError(state)) return chunks;
+      return chunks.map(ensureResponsesUsageDetails);
+    };
+    // Responses output: prepare the apply_patch state even for an empty EOF (Go: InitializeApplyPatchStream).
+    initializeApplyPatchStream(ctx, FormatOpenAI, responseFormat, req.model, prepared.originalPayload, prepared.body, state);
 
     let seenDone = false;
     let sawFinishReason = false;
@@ -421,6 +437,7 @@ export class OpenAICompatExecutor implements ProviderExecutor {
             emitted++;
             yield chunk;
           }
+          if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
           if (out.done) {
             finished = true;
             break;
@@ -435,18 +452,34 @@ export class OpenAICompatExecutor implements ProviderExecutor {
             emitted++;
             yield chunk;
           }
+          if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
           if (out.done) break;
         }
       }
+      // EndApplyPatchStream: an apply_patch-enabled Responses stream must not end without its terminator.
+      if (!opts.signal?.aborted) {
+        for (const chunk of finalizeApplyPatchStream(state)) {
+          if (chunk !== "") yield chunk;
+        }
+        if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
+      }
       if (seenDone) return;
       if (opts.signal?.aborted) return;
+      // A Responses stream whose output is complete may synthesize the missing [DONE] (Go: CanFinalizeResponseStream).
+      if (readError === undefined && responseFormat === FormatOpenAIResponse && canFinalizeResponseStream(state)) {
+        const finalChunks = translate("data: [DONE]");
+        for (const chunk of finalChunks) {
+          if (chunk !== "") yield chunk;
+        }
+        if (finalChunks.length > 0) return;
+      }
       if (readError !== undefined) {
         const message = readError instanceof Error ? readError.message : String(readError);
         throw new StatusError(502, "upstream stream read error: " + message, { cause: readError });
       }
-      // Without a translator-confirmed terminal state, a clean Claude EOF without
-      // [DONE] remains a failed stream instead of completing it.
-      if (responseFormat === FormatClaude && !sawFinishReason) throw new StatusError(502, "upstream stream closed before [DONE]");
+      // Without a translator-confirmed terminal state, a clean Responses or Claude
+      // EOF without [DONE] remains a failed stream instead of completing it.
+      if (responseFormat === FormatOpenAIResponse || (responseFormat === FormatClaude && !sawFinishReason)) throw new StatusError(502, "upstream stream closed before [DONE]");
       if (emitted === 0) throw noOutputError();
       // Providers that omit [DONE] after the finish_reason: flush the terminal frames.
       for (const chunk of translate("data: [DONE]")) {

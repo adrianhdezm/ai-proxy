@@ -7,7 +7,8 @@ import type { Config } from "../config/types.ts";
 import { log } from "../log.ts";
 import type { ModelRegistry } from "../registry/index.ts";
 import { ClaudeCodeAPIHandler, type ExecutionManager } from "./claude_handlers.ts";
-import { OpenAIImagesHandler } from "./images_handlers.ts";
+import { OpenAIImagesHandler, openAIErrorMessage, openAIErrorResponse } from "./images_handlers.ts";
+import { OpenAIResponsesAPIHandler, isOpenAIModelsRequest } from "./responses_handlers.ts";
 import { claudeErrorMessage, claudeErrorResponse } from "./errors.ts";
 import { usageStatisticsResponse } from "../usage/http.ts";
 import type { UsageStatistics } from "../usage/statistics.ts";
@@ -45,6 +46,8 @@ export interface ProxyServer {
   /** The listening Bun server, when started. */
   readonly server: Server<undefined> | undefined;
   readonly handler: ClaudeCodeAPIHandler;
+  /** The OpenAI Responses handler (/v1/responses, /v1/responses/compact, OpenAI /v1/models). */
+  readonly responsesHandler: OpenAIResponsesAPIHandler;
 }
 
 /** Request headers browser clients may send (Go: corsAllowedRequestHeaders). */
@@ -86,6 +89,13 @@ export function createServer(options: ServerOptions): ProxyServer {
     usage: options.usage,
     now: options.now,
   });
+  const responsesHandler = new OpenAIResponsesAPIHandler({
+    manager: options.manager,
+    registry: options.registry,
+    passthroughHeaders: options.passthroughHeaders,
+    usage: options.usage,
+    now: options.now,
+  });
   const passthroughHeaders = options.passthroughHeaders ?? false;
   let server: Server<undefined> | undefined;
 
@@ -114,6 +124,8 @@ export function createServer(options: ServerOptions): ProxyServer {
     if (!path.startsWith("/v1/")) return errorResponse(404, "not_found_error", `Not Found: ${method} ${path}`);
 
     const authError = authenticate(request, url, apiKeys);
+    const responsesPath = path === "/v1/responses" || path === "/v1/responses/compact";
+    if (authError && responsesPath) return openAIErrorResponse(openAIErrorMessage(401, { message: authError, type: "authentication_error", code: "invalid_api_key" }));
     if (authError) return errorResponse(401, "authentication_error", authError);
 
     if (path === "/v1/messages" || path === "/v1/messages/count_tokens") {
@@ -129,13 +141,25 @@ export function createServer(options: ServerOptions): ProxyServer {
       return path === "/v1/images/generations" ? imagesHandler.imagesGenerations(request, imagesContext) : imagesHandler.imagesEdits(request, imagesContext);
     }
 
+    if (responsesPath) {
+      if (method !== "POST") return methodNotAllowed(["POST"]);
+      const body = await readRequestBody(request, maxBodyBytes);
+      if ("error" in body) {
+        const status = body.error.status;
+        return openAIErrorResponse(openAIErrorMessage(status, { message: status === 413 ? "request body too large" : "Invalid request: unreadable body", type: "invalid_request_error" }));
+      }
+      const responsesContext = { clientKey: authenticatedAPIKey(request, url, apiKeys) };
+      return path === "/v1/responses" ? responsesHandler.responses(request, body.text, responsesContext) : responsesHandler.compact(request, body.text, responsesContext);
+    }
+
     if (path === "/v1/models") {
       if (method !== "GET") return methodNotAllowed(["GET"]);
-      return handler.claudeModels();
+      return isOpenAIModelsRequest(request, url) ? responsesHandler.openAIModels() : handler.claudeModels();
     }
     if (path.startsWith("/v1/models/")) {
       if (method !== "GET") return methodNotAllowed(["GET"]);
-      return handler.claudeModelDetail(decodeURIComponent(path.slice("/v1/models/".length)));
+      const modelID = decodeURIComponent(path.slice("/v1/models/".length));
+      return isOpenAIModelsRequest(request, url) ? responsesHandler.openAIModelDetail(modelID) : handler.claudeModelDetail(modelID);
     }
 
     return errorResponse(404, "not_found_error", `Not Found: ${method} ${path}`);
@@ -165,6 +189,7 @@ export function createServer(options: ServerOptions): ProxyServer {
       return server;
     },
     handler,
+    responsesHandler,
     start() {
       if (server) return server;
       server = Bun.serve({

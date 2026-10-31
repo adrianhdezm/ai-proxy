@@ -16,7 +16,7 @@ import { AuthManager, authKind, AuthKindAPIKey, setQuotaCooldownDisabled, setTra
 import { StatusDisabled, type Auth } from "./auth/types.ts";
 import { modelOverridesFor, synthesizeApiKeyAuths } from "./config/auths.ts";
 import type { Config, ModelOverride } from "./config/types.ts";
-import { createExecutors } from "./executor/index.ts";
+import { applyClaudeToolSearchSetting, createExecutors } from "./executor/index.ts";
 import type { ProviderExecutor } from "./executor/types.ts";
 import { log, setLogLevel } from "./log.ts";
 import {
@@ -89,6 +89,8 @@ export async function createApp(config: Config, options: AppOptions = {}): Promi
 
   // Global cooldown switches (Go: SetQuotaCooldownDisabled / SetTransientErrorCooldownSeconds).
   setQuotaCooldownDisabled(config.routing.cooldown.disabled);
+  // upstream.claude.tool-search: Responses -> Claude native tool search (also with injected executors).
+  applyClaudeToolSearchSetting(config);
   setTransientErrorCooldownSeconds(config.routing.cooldown.transientErrorSeconds);
 
   const manager = new AuthManager({

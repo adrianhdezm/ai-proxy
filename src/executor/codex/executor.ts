@@ -29,15 +29,27 @@
 // declared (ensureImageGenerationTool) unless options.disableImageGeneration is
 // set, in which case any image_generation tool / tool_choice is stripped.
 //
+// Responses inbound (sourceFormat "openai-response"): the request goes through
+// the normalising Responses -> Codex translator and the stream comes back as raw
+// SSE lines; a native Codex request (Responses Lite) keeps its completed output
+// untouched (preserveNativeOutput). /v1/responses/compact (opts.alt
+// "responses/compact") is executeCompact: the Responses body is posted to
+// <base>/responses/compact without translation and the JSON answer returned.
+// As upstream, the Codex executor never installs the apply_patch bridge: Codex
+// understands custom tools natively (only the dropped xAI / Kimi / Meta
+// executors normalised apply_patch).
+//
 // Not ported (outside this slice): SIWC credentials and body rules, zstd request
-// compression, websockets transport, /responses/compact, multi-agent v2 optimisation, prompt-cache keys (Session-Id), the payload
+// compression, websockets transport, multi-agent v2 optimisation, prompt-cache keys (Session-Id), the payload
 // config finalizer, usage reporting and request logging, the Claude input-token
 // estimate on message_start, and the Home refresh/file-lock path.
 import type { Auth } from "../../auth/types.ts";
 import { CodexAuthenticator } from "../../auth/codex/index.ts";
-import { FormatCodex, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
+import { FormatCodex, FormatOpenAIResponse, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
+import { applyPatchTranslationError, applyPatchUpstreamError, applyPatchUpstreamErrorMessage, ensureResponsesUsageDetails } from "../responses.ts";
 import { defaultRegistry } from "../../translator/registry.ts";
 import "../../translator/codex/claude/index.ts";
+import "../../translator/codex/openai/responses/index.ts";
 import { parseSuffix } from "../../thinking/index.ts";
 import { getAt, gstr, isObj } from "../../util/gpath.ts";
 import { tryParse } from "../../util/json.ts";
@@ -76,6 +88,7 @@ import { type CodexSSEItem, CodexSSEScanner, scanCodexSSEText, utf8Len } from ".
 import { codexBootstrapMaxBufferedBytes, codexBootstrapMaxBufferedFrames, isCodexBootstrapBufferableEvent, newCodexBootstrapOverloadErr } from "./bootstrap.ts";
 import {
   type CodexReasoningReplayScope,
+  emptyCodexReasoningReplayScope,
   applyCodexReasoningReplayCache,
   cacheCodexReasoningReplayFromCompleted,
   clearCodexReasoningReplayOnInvalidSignature,
@@ -88,6 +101,9 @@ import { type CodexImagesContext, executeCodexOpenAIImage, executeCodexOpenAIIma
 
 /** Injectable fetch for tests; defaults to the global fetch. */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+/** ExecOptions.alt selecting the compaction endpoint (Go: opts.Alt == "responses/compact"). */
+export const CodexCompactAlt = "responses/compact";
 
 /** Message of the 502 raised when an accepted stream ends before any translated payload (failover-eligible). */
 export const codexEmptyStreamMessage = "upstream stream closed before first payload";
@@ -239,6 +255,7 @@ export class CodexExecutor implements ProviderExecutor {
   }
 
   async execute(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
+    if (opts.alt === CodexCompactAlt) return this.executeCompact(auth, req, opts);
     if (isCodexOpenAIImageRequest(opts)) return executeCodexOpenAIImage(this.imagesContext(), auth, req, opts);
     const prepared = this.prepare(auth, req, opts, false);
     const resp = await this.send(auth, prepared, opts);
@@ -271,8 +288,10 @@ export class CodexExecutor implements ProviderExecutor {
       if (eventType === "response.completed") cacheCodexReasoningReplayFromCompleted(this.replayCache, prepared.replayScope, completedData);
       const state: TranslatorState = {};
       const ctx: TranslateContext = { signal: opts.signal };
-      const out = defaultRegistry.translateNonStream(ctx, FormatCodex, prepared.responseFormat, req.model, prepared.originalPayload, prepared.body, completedData, state);
+      let out = defaultRegistry.translateNonStream(ctx, FormatCodex, prepared.responseFormat, req.model, prepared.originalPayload, prepared.body, completedData, state);
+      if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
       if (out.length === 0) throw new StatusError(502, "upstream returned an unusable response");
+      if (prepared.responseFormat === FormatOpenAIResponse) out = ensureResponsesUsageDetails(out);
       const usage = parseCodexUsage(root);
       return { payload: out, headers: resp.headers, metadata: usage ? { usage } : undefined };
     }
@@ -281,6 +300,7 @@ export class CodexExecutor implements ProviderExecutor {
   }
 
   async executeStream(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<StreamResult> {
+    if (opts.alt === CodexCompactAlt) throw new StatusError(400, "streaming not supported for /responses/compact", { requestScoped: true });
     if (isCodexOpenAIImageRequest(opts)) return executeCodexOpenAIImageStream(this.imagesContext(), auth, req, opts);
     const prepared = this.prepare(auth, req, opts, true);
     const resp = await this.send(auth, prepared, opts);
@@ -421,6 +441,53 @@ export class CodexExecutor implements ProviderExecutor {
     }
   }
 
+  /**
+   * POST <base>/responses/compact (Go: executeCompact). The Responses body is
+   * not translated (source and target are both "openai-response"); the
+   * stream flag is removed, instructions normalised, web_search declared for
+   * replayed web_search_call history and tool schemas normalised. The JSON
+   * answer (object "response.compaction") is returned as is.
+   */
+  private async executeCompact(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
+    const baseModel = parseSuffix(req.model).modelName;
+    const { apiKey } = codexCreds(auth);
+    const baseURL = codexBaseURL(auth);
+    const from = opts.sourceFormat;
+    const responseFormat = responseFormatOrSource(opts);
+    const to = FormatOpenAIResponse;
+    const originalPayload = opts.originalRequest && opts.originalRequest.length > 0 ? opts.originalRequest : req.payload;
+    const isCompat = resolvedModelInfo(req)?.isCompat === true;
+    let body: string;
+    try {
+      body = translateCodexRequestPair(from, to, baseModel, originalPayload, req.payload, false, isCompat).body;
+      body = applyRequestThinking(body, req, opts, from, to, this.identifier);
+    } catch (err) {
+      throw asRequestError(err);
+    }
+    body = setStringIfDifferent(body, "model", baseModel);
+    body = deleteFields(body, "stream");
+    body = normalizeCodexInstructions(body, isNativeCodexRequest(req.payload, from, responseFormat, opts.headers));
+    body = ensureWebSearchToolForHistory(body, opts.headers);
+    body = normalizeCodexParallelToolCalls(body, opts.headers);
+    body = normalizeCodexToolSchemas(body);
+    body = sanitizeCodexInputItemIDs(body);
+
+    const url = baseURL.replace(/\/+$/, "") + "/responses/compact";
+    const headers = new Headers();
+    applyCodexHeaders(headers, auth, apiKey, false, { disableCloaking: this.options.disableCloaking, headerDefaults: this.options.headerDefaults }, opts.headers);
+    applyCodexRoutingHint(headers, auth, baseModel, body, opts.headers);
+    applyModelHeaderOverrides(headers, baseModel);
+    const prepared: PreparedRequest = { url, headers, body, originalPayload, from, responseFormat, preserveNativeOutput: false, replayScope: emptyCodexReasoningReplayScope() };
+    const resp = await this.send(auth, prepared, opts);
+    if (resp.status < 200 || resp.status >= 300) throw await this.statusError(resp, prepared.replayScope);
+    const data = await resp.text();
+    const state: TranslatorState = {};
+    let out = defaultRegistry.translateNonStream({ signal: opts.signal }, to, responseFormat, req.model, originalPayload, body, data, state);
+    if (applyPatchTranslationError(state) || out.length === 0) throw new StatusError(502, applyPatchUpstreamErrorMessage);
+    if (responseFormat === FormatOpenAIResponse) out = ensureResponsesUsageDetails(out);
+    return { payload: out, headers: resp.headers };
+  }
+
   /** @internal Used by CodexStreamProcessor. */
   terminalFailure(data: string): TerminalFailure | undefined {
     return codexTerminalFailureErrWithCooling(data, this.modelLevelCooling, this.now());
@@ -548,7 +615,9 @@ class CodexStreamProcessor {
       // Comments, event:, id:, retry: and blank lines carry no event; they are held with their frame.
       handshake = true;
     }
-    const chunks = defaultRegistry.translateStream(this.ctx, FormatCodex, this.prepared.responseFormat, this.req.model, this.prepared.originalPayload, this.prepared.body, translatedLine, this.state);
+    let chunks = defaultRegistry.translateStream(this.ctx, FormatCodex, this.prepared.responseFormat, this.req.model, this.prepared.originalPayload, this.prepared.body, translatedLine, this.state);
+    // Go: TranslateStreamWithClaudeInputTokens completes Responses usage details on every chunk.
+    if (this.prepared.responseFormat === FormatOpenAIResponse && !applyPatchTranslationError(this.state)) chunks = chunks.map(ensureResponsesUsageDetails);
     return { chunks, terminal, handshake };
   }
 }

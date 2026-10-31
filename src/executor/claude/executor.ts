@@ -13,8 +13,13 @@
 //   CCH placeholder -> betas lifted from body -> CCH signing (last mutation) ->
 //   mid-system validation -> headers -> POST -> continuity commit / replay cache
 //
-// Skipped from upstream (see the slice report): MCP alias remapping, web-search
-// result cache, compaction, tool_search fallback, fast-mode error wrappers,
+// Responses inbound (sourceFormat "openai-response"): the native tool search
+// fallback (applyNativeToolSearchFallback, upstream.claude.tool-search pinned
+// per request), the web search result cache (client.codex.web-search-result-cache),
+// apply_patch stream finalisation and EnsureResponsesUsageDetails.
+//
+// Skipped from upstream (see the slice report): MCP alias remapping,
+// compaction, fast-mode error wrappers,
 // usage reporting plugins, payload config rules, preserved-thinking block
 // binding, local token estimation and the OAuth profile prefetch.
 import { ClaudeAuthenticator } from "../../auth/claude/authenticator.ts";
@@ -22,7 +27,26 @@ import { type Auth, isAPIKeyAuth } from "../../auth/types.ts";
 import { log } from "../../log.ts";
 import { parseSuffix } from "../../thinking/suffix.ts";
 import { translateNonStream, translateRequest, translateStream, translateTokenCount } from "../../translator/registry.ts";
-import { FormatClaude, type TranslatorState } from "../../translator/types.ts";
+import { FormatClaude, FormatOpenAIResponse, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
+import { clientToolSearchEnabled, convertOpenAIResponsesRequestToClaudeWithToolSearch, withClientToolSearch } from "../../translator/claude/openai/responses/index.ts";
+import { responsesHasToolSearch, stripResponsesToolSearch } from "../../util/responses_tool_search.ts";
+import { ClaudeWebSearchResultCache, defaultClaudeWebSearchResultCache } from "../../cache/claude_web_search_result_cache.ts";
+import {
+  applyPatchOriginalRequest,
+  applyPatchTranslationError,
+  applyPatchUpstreamError,
+  ensureResponsesUsageDetails,
+  finalizeApplyPatchStream,
+  initializeApplyPatchStream,
+} from "../responses.ts";
+import {
+  type ClaudeWebSearchResultCacheConfig,
+  type ClaudeWebSearchResultScope,
+  claudeWebSearchResultCacheScope,
+  recordClaudeWebSearchResults,
+  restoreClaudeWebSearchResults,
+} from "./web_search_results.ts";
+import { claudeModelLacksToolSearch } from "./tool_search.ts";
 import { stripClaudeCodeAttributionSystem } from "../../util/claude_attribution.ts";
 import { getAt, gint, isObj } from "../../util/gpath.ts";
 import { tryParse } from "../../util/json.ts";
@@ -131,6 +155,22 @@ export interface ClaudeExecutorConfig {
   thinkingReplayCache?: ClaudeThinkingReplayCache;
   /** Optional upstream model rewrite; when set the requested model is written back into responses. */
   upstreamModelNormalizer?: (baseModel: string) => string;
+  /**
+   * client.codex.web-search-result-cache: store the web_search_tool_result
+   * blocks of Responses-inbound responses and restore them into later requests
+   * of the same session and credential. Disabled by default, as upstream.
+   */
+  webSearchResultCache?: ClaudeWebSearchResultCacheConfig;
+  /** Web search result store; defaults to the process-wide cache (or a private one when `now` is set). */
+  webSearchResultStore?: ClaudeWebSearchResultCache;
+}
+
+/** What applyNativeToolSearchFallback decided for one request. */
+interface ToolSearchDecision {
+  req: ExecRequest;
+  opts: ExecOptions;
+  /** upstream.claude.tool-search pinned for the request and response translations. */
+  toolSearch: boolean;
 }
 
 const to = FormatClaude;
@@ -142,6 +182,7 @@ export class ClaudeExecutor implements ProviderExecutor {
   private readonly now: () => number;
   readonly continuity: ClaudeContinuityStore;
   readonly replayCache: ClaudeThinkingReplayCache;
+  readonly webSearchResults: ClaudeWebSearchResultCache;
 
   constructor(cfg: ClaudeExecutorConfig = {}) {
     this.cfg = cfg;
@@ -149,6 +190,52 @@ export class ClaudeExecutor implements ProviderExecutor {
     this.now = cfg.now ?? (() => Date.now());
     this.continuity = cfg.continuityStore ?? (cfg.now ? new ClaudeContinuityStore(cfg.now) : defaultClaudeContinuityStore);
     this.replayCache = cfg.thinkingReplayCache ?? (cfg.now ? new ClaudeThinkingReplayCache({ now: cfg.now }) : defaultClaudeThinkingReplayCache);
+    this.webSearchResults = cfg.webSearchResultStore ?? (cfg.now ? new ClaudeWebSearchResultCache({ now: cfg.now }) : defaultClaudeWebSearchResultCache);
+  }
+
+  /**
+   * Whether a credential can receive Codex tool_search as Anthropic native
+   * tool search for the upstream model: Anthropic's own origin, or a custom
+   * base URL with attributes.native_tool_search "true"; never for models that
+   * predate tool search, nor while upstream.claude.tool-search is off
+   * (Go: SupportsNativeToolSearch).
+   */
+  supportsNativeToolSearch(auth: Auth | undefined, upstreamModel: string, toolSearch = clientToolSearchEnabled()): boolean {
+    if (!toolSearch || claudeModelLacksToolSearch(upstreamModel)) return false;
+    const baseURL = claudeCreds(auth).baseURL.trim();
+    if (baseURL === "" || isAnthropicUpstreamBase(baseURL)) return true;
+    return (auth?.attributes?.native_tool_search ?? "").trim().toLowerCase() === "true";
+  }
+
+  /**
+   * Pins upstream.claude.tool-search for a Responses request and removes
+   * client tool_search from it when the credential cannot use native tool
+   * search, so the translation matches the pre-tool-search one
+   * (Go: applyNativeToolSearchFallback).
+   */
+  applyNativeToolSearchFallback(auth: Auth, upstreamModel: string, req: ExecRequest, opts: ExecOptions): ToolSearchDecision {
+    const toolSearch = clientToolSearchEnabled();
+    if (opts.sourceFormat !== FormatOpenAIResponse || !toolSearch) return { req, opts, toolSearch };
+    if (!responsesHasToolSearch(req.payload) && !(opts.originalRequest && responsesHasToolSearch(opts.originalRequest))) return { req, opts, toolSearch };
+    if (this.supportsNativeToolSearch(auth, upstreamModel, toolSearch)) return { req, opts, toolSearch };
+    const stripped: ExecRequest = { ...req, payload: stripResponsesToolSearch(req.payload) };
+    const strippedOpts: ExecOptions = opts.originalRequest && opts.originalRequest.length > 0 ? { ...opts, originalRequest: stripResponsesToolSearch(opts.originalRequest) } : opts;
+    log.debug(`claude executor: native tool search unavailable, removed tool_search from request (model=${upstreamModel})`);
+    return { req: stripped, opts: strippedOpts, toolSearch };
+  }
+
+  private toolSearchDecision(auth: Auth, req: ExecRequest, opts: ExecOptions): ToolSearchDecision {
+    return this.applyNativeToolSearchFallback(auth, this.upstreamModel(parseSuffix(req.model).modelName), req, opts);
+  }
+
+  /** Translates the inbound payload to Claude; Responses requests use the pinned tool-search switch. */
+  private translateToClaude(from: string, baseModel: string, req: ExecRequest, stream: boolean, toolSearch: boolean): string {
+    if (from === FormatOpenAIResponse) return convertOpenAIResponsesRequestToClaudeWithToolSearch(baseModel, req.payload, stream, toolSearch, apiKeyModelIsCompat(req));
+    return translateRequest(from, to, baseModel, req.payload, stream);
+  }
+
+  private webSearchScope(auth: Auth, req: ExecRequest, opts: ExecOptions, originalPayload: string): ClaudeWebSearchResultScope {
+    return claudeWebSearchResultCacheScope(this.cfg.webSearchResultCache, auth, opts.sourceFormat, req, opts, originalPayload);
   }
 
   private sessionDatePinRetentionMs(): number {
@@ -209,7 +296,8 @@ export class ClaudeExecutor implements ProviderExecutor {
     req: ExecRequest,
     opts: ExecOptions,
     upstreamStream: boolean,
-  ): { url: string; headers: Headers; body: string; bodyForTranslation: string; originalPayload: string; diagnostics: ClaudeDiagnosticsRequestState } {
+    toolSearch: boolean,
+  ): { url: string; headers: Headers; body: string; bodyForTranslation: string; originalPayload: string; diagnostics: ClaudeDiagnosticsRequestState; webSearch: ClaudeWebSearchResultScope } {
     const baseModel = parseSuffix(req.model).modelName;
     const upstreamModel = this.upstreamModel(baseModel);
     const { apiKey, baseURL: configuredBase } = claudeCreds(auth);
@@ -241,10 +329,12 @@ export class ClaudeExecutor implements ProviderExecutor {
       timezone: this.cfg.headerDefaults?.timezone ?? "",
     };
 
-    let body = translateRequest(from, to, baseModel, req.payload, upstreamStream);
+    let body = this.translateToClaude(from, baseModel, req, upstreamStream, toolSearch);
     body = setStringIfDifferent(body, "model", upstreamModel);
     body = normalizeClaudeToolChoice(this.identifier, upstreamModel, body);
     body = applyRequestThinking(body, req, opts, from, to, this.identifier);
+    const webSearch = this.webSearchScope(auth, req, opts, originalPayload);
+    body = restoreClaudeWebSearchResults(this.webSearchResults, webSearch, body);
     if (this.cfg.rebuildMidSystemMessage) body = rebuildMidSystemMessagesToTopLevel(body);
 
     let isProbeOrHelper = isClaudeProbeOrHelperRequest(body);
@@ -335,25 +425,28 @@ export class ClaudeExecutor implements ProviderExecutor {
       confirmedClaudeCode: confirmedClaudeCode && !cloaked,
       sessionID,
     });
-    return { url, headers, body: bodyForUpstream, bodyForTranslation, originalPayload, diagnostics };
+    return { url, headers, body: bodyForUpstream, bodyForTranslation, originalPayload, diagnostics, webSearch };
   }
 
   async execute(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
+    const decision = this.toolSearchDecision(auth, req, opts);
+    req = decision.req;
+    opts = decision.opts;
     const replay = this.prepareReplay(auth, req, opts);
     try {
-      return await this.executeInner(auth, replay.req, opts, replay.scope);
+      return await this.executeInner(auth, replay.req, opts, replay.scope, decision.toolSearch);
     } catch (err) {
       this.clearReplayAfterError(replay.scope, err);
       throw err;
     }
   }
 
-  private async executeInner(auth: Auth, req: ExecRequest, opts: ExecOptions, replayScope: ClaudeThinkingReplayScope): Promise<ExecResponse> {
+  private async executeInner(auth: Auth, req: ExecRequest, opts: ExecOptions, replayScope: ClaudeThinkingReplayScope, toolSearch: boolean): Promise<ExecResponse> {
     const responseFormat = responseFormatOrSource(opts);
     // Native Claude responses use the JSON path; other response formats need the
     // upstream event stream so the registered translator can aggregate it.
     const upstreamStream = responseFormat !== to;
-    const prepared = this.prepare(auth, req, opts, upstreamStream);
+    const prepared = this.prepare(auth, req, opts, upstreamStream, toolSearch);
     const res = await this.send(prepared.url, prepared.headers, prepared.body, auth, opts);
     if (res.status < 200 || res.status >= 300) throw await this.upstreamError(res);
     let data = await readAllText(decodeResponseBody(res.body, claudeResponseContentEncoding(res.headers)));
@@ -366,20 +459,27 @@ export class ClaudeExecutor implements ProviderExecutor {
       commitClaudeContinuity(this.continuity, prepared.diagnostics, claudeMessageIDFromResponse(data), requestID);
     }
     data = this.restoreResponseModel(data, req.model);
+    recordClaudeWebSearchResults(this.webSearchResults, prepared.webSearch, data);
     cacheClaudeThinkingReplayResponse(this.replayCache, replayScope, data);
     const state: TranslatorState = {};
-    const out = translateNonStream({ signal: opts.signal }, to, responseFormat, req.model, prepared.originalPayload, prepared.bodyForTranslation, data, state);
+    const ctx = withClientToolSearch({ signal: opts.signal }, toolSearch);
+    let out = translateNonStream(ctx, to, responseFormat, req.model, applyPatchOriginalRequest(req, opts), prepared.bodyForTranslation, data, state);
+    if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
     if (out.length === 0) throw new StatusError(502, "claude executor: response translation produced no output");
+    if (responseFormat === FormatOpenAIResponse) out = ensureResponsesUsageDetails(out);
     const metadata: Record<string, unknown> = {};
     if (!upstreamStream) metadata.usage = parseClaudeUsage(data);
     return { payload: out, headers: res.headers, metadata };
   }
 
   async executeStream(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<StreamResult> {
+    const decision = this.toolSearchDecision(auth, req, opts);
+    req = decision.req;
+    opts = decision.opts;
     const replay = this.prepareReplay(auth, req, opts);
     let result: StreamResult;
     try {
-      result = await this.executeStreamInner(auth, replay.req, opts);
+      result = await this.executeStreamInner(auth, replay.req, opts, decision.toolSearch);
     } catch (err) {
       this.clearReplayAfterError(replay.scope, err);
       throw err;
@@ -387,13 +487,18 @@ export class ClaudeExecutor implements ProviderExecutor {
     return claudeThinkingReplayScopeValid(replay.scope) ? wrapClaudeThinkingReplayStream(this.replayCache, result, replay.scope) : result;
   }
 
-  private async executeStreamInner(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<StreamResult> {
+  private async executeStreamInner(auth: Auth, req: ExecRequest, opts: ExecOptions, toolSearch: boolean): Promise<StreamResult> {
     const responseFormat = responseFormatOrSource(opts);
-    const prepared = this.prepare(auth, req, opts, true);
+    const prepared = this.prepare(auth, req, opts, true, toolSearch);
     const res = await this.send(prepared.url, prepared.headers, prepared.body, auth, opts);
     if (res.status < 200 || res.status >= 300) throw await this.upstreamError(res);
     const decoded = decodeResponseBody(res.body, claudeResponseContentEncoding(res.headers));
-    const restore = (frame: string): string => this.restoreResponseModel(frame, req.model);
+    const webSearch = prepared.webSearch;
+    const restore = (frame: string): string => {
+      const restored = this.restoreResponseModel(frame, req.model);
+      recordClaudeWebSearchResults(this.webSearchResults, webSearch, restored);
+      return restored;
+    };
     const signal = opts.signal;
     const requestID = headerValueCaseInsensitive(res.headers, "request-id");
     // Continuity advances only once the upstream stream reached message_stop.
@@ -401,11 +506,14 @@ export class ClaudeExecutor implements ProviderExecutor {
     const chunks =
       responseFormat === to
         ? passthroughChunks(decoded, restore, signal, onComplete)
-        : translatedChunks(decoded, restore, signal, responseFormat, req.model, prepared.originalPayload, prepared.bodyForTranslation, onComplete);
+        : translatedChunks(decoded, restore, withClientToolSearch({ signal }, toolSearch), responseFormat, req.model, applyPatchOriginalRequest(req, opts), prepared.bodyForTranslation, onComplete);
     return { headers: res.headers, chunks };
   }
 
   async countTokens(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
+    const decision = this.toolSearchDecision(auth, req, opts);
+    req = decision.req;
+    opts = decision.opts;
     const baseModel = parseSuffix(req.model).modelName;
     const upstreamModel = this.upstreamModel(baseModel);
     const { apiKey, baseURL: configuredBase } = claudeCreds(auth);
@@ -421,10 +529,11 @@ export class ClaudeExecutor implements ProviderExecutor {
     const confirmedClaudeCode = isEffectiveConfirmedClaudeCode(detection, initialPolicy);
     const sessionID = fp.profileClaudeCodeCLI ? claudeAgentSessionUUIDForRequest(incomingHeaders, originalPayload, req.payload, confirmedClaudeCode, opts.metadata, req.metadata) : "";
 
-    let body = translateRequest(from, to, baseModel, req.payload, from !== to);
+    let body = this.translateToClaude(from, baseModel, req, from !== to, decision.toolSearch);
     body = setStringIfDifferent(body, "model", upstreamModel);
     body = normalizeClaudeToolChoice(this.identifier, upstreamModel, body);
     body = applyRequestThinking(body, req, opts, from, to, this.identifier);
+    body = restoreClaudeWebSearchResults(this.webSearchResults, this.webSearchScope(auth, req, opts, originalPayload), body);
     if (this.cfg.rebuildMidSystemMessage) body = rebuildMidSystemMessagesToTopLevel(body);
     const directAnthropic = isAnthropicUpstreamBase(baseURL);
     const [policy] = resolveClaudeWirePolicy(this.cfg, auth, apiKey, confirmedClaudeCode);
@@ -516,25 +625,44 @@ async function* passthroughChunks(
   finishStream(state, signal, onComplete);
 }
 
-/** Translates each upstream event through the registry (Go: ExecuteStream, other response formats). */
+/**
+ * Translates each upstream event through the registry (Go: ExecuteStream, other
+ * response formats). For Responses output every chunk gets complete usage
+ * details, an apply_patch translation failure ends the stream with the
+ * sanitised 502 after its one failure frame, and the translator state is
+ * finalized at the end of the transport (Go: EndApplyPatchStream).
+ */
 async function* translatedChunks(
   decoded: ReadableStream<Uint8Array>,
   restore: (frame: string) => string,
-  signal: AbortSignal | undefined,
+  ctx: TranslateContext,
   responseFormat: string,
   model: string,
   originalPayload: string,
   bodyForTranslation: string,
   onComplete?: (state: ClaudeStreamState) => void,
 ): AsyncGenerator<string> {
+  const signal = ctx.signal;
   const state = newClaudeStreamState();
   const translatorState: TranslatorState = {};
+  const responses = responseFormat === FormatOpenAIResponse;
+  initializeApplyPatchStream(ctx, to, responseFormat, model, originalPayload, bodyForTranslation, translatorState);
   for await (const ev of iterateSSE(decoded, signal)) {
     const frame = restore(frameOf(ev.raw));
     observeClaudeSSEEvent(frame, state);
-    const outputs = translateStream({ signal }, to, responseFormat, model, originalPayload, bodyForTranslation, frame, translatorState);
-    for (const out of outputs) yield out;
+    // Go fed the translator one scanned line at a time; the translators expect `data: {...}` lines.
+    const outputs: string[] = [];
+    for (const line of frame.split("\n")) {
+      if (line.trim() === "") continue;
+      outputs.push(...translateStream(ctx, to, responseFormat, model, originalPayload, bodyForTranslation, line, translatorState));
+      if (applyPatchTranslationError(translatorState) !== undefined) break;
+    }
+    const failed = applyPatchTranslationError(translatorState) !== undefined;
+    for (const out of outputs) yield responses && !failed ? ensureResponsesUsageDetails(out) : out;
+    if (failed) throw applyPatchUpstreamError();
     if (state.completed || state.streamErr) break;
   }
+  for (const out of finalizeApplyPatchStream(translatorState)) yield out;
+  if (applyPatchTranslationError(translatorState) !== undefined) throw applyPatchUpstreamError();
   finishStream(state, signal, onComplete);
 }

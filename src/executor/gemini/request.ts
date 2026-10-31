@@ -5,6 +5,7 @@
 // bare body before the Code Assist envelope is added) and aistudio_executor.go
 // (normalizeAIStudioThinkingLevel).
 import "../../translator/gemini/claude/index.ts";
+import "../../translator/gemini/openai/responses/index.ts";
 import { lookupModelInfo } from "../../registry/index.ts";
 import { applyThinkingWithSourceAndSummary, extractSummaryConfig, parseSuffix } from "../../thinking/index.ts";
 import { defaultRegistry } from "../../translator/registry.ts";

@@ -1,7 +1,5 @@
 // Ported from: internal/runtime/executor/codex_executor_stream_output_test.go
-// Skipped cases: none dropped; adaptations: openai-response inbound requests pass through untranslated in this
-//   port, so the non-stream openai-response cases read the completed event (`response.output...`) instead of
-//   the Go openai-response translation; the OpenAI chat case (TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone)
+// Skipped cases: none dropped; adaptations: the OpenAI chat case (TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone)
 //   uses a Claude request; TestCodexAutoExecutorHTTPFallbackForwardsSequentialCutoffReasoningSummaryDelivery runs on the
 //   plain executor (the auto/websocket executor is not ported). Transport failures are simulated with a
 //   ReadableStream that errors after its last chunk (Go: unexpectedEOFReader). Added: a context-length terminal
@@ -34,9 +32,9 @@ describe("codex executor stream output", () => {
           `data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[{"id":null,"type":"function_call","call_id":"call_123","name":"weather-terminal","arguments":"{}"},{"id":"fc_existing","type":"function_call","call_id":"call_existing","name":"preserved","arguments":"{}"}]}}\n\n`,
       );
     const resp = await executor.execute(auth(), request("gpt-5.4", `{"model":"gpt-5.4","input":"What is the weather?"}`), options("openai-response", false));
-    expect(getString(resp.payload, "response.output.0.id")).toBe("fc_123");
-    expect(getString(resp.payload, "response.output.0.name")).toBe("weather-terminal");
-    expect(getString(resp.payload, "response.output.1.id")).toBe("fc_existing");
+    expect(getString(resp.payload, "output.0.id")).toBe("fc_123");
+    expect(getString(resp.payload, "output.0.name")).toBe("weather-terminal");
+    expect(getString(resp.payload, "output.1.id")).toBe("fc_existing");
   });
 
   test("TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone (Claude)", async () => {

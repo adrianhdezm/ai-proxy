@@ -1,13 +1,17 @@
 // Upstream transport and the SSE stream loop shared by the Gemini CLI and AI
 // Studio executors. Port of the ExecuteStream goroutines of v7.0.12
 // gemini_cli_executor.go and current gemini_executor.go (line scanner ->
-// response translator -> "[DONE]" flush), without the usage reporter and the
-// apply_patch tool-input machinery.
+// response translator -> "[DONE]" flush), without the usage reporter. For the
+// Responses response format the apply_patch tool-input state is initialised
+// before the first chunk and finalized at the end of the transport, and a
+// retained tool-input failure ends the stream with the sanitised 502
+// (Go: InitializeApplyPatchStream / StopApplyPatchStream / EndApplyPatchStream).
 import type { FetchLike } from "../../auth/oauth/http.ts";
 import { log } from "../../log.ts";
 import { defaultRegistry } from "../../translator/registry.ts";
-import { FormatClaude, FormatGemini, FormatOpenAI, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
+import { FormatClaude, FormatGemini, FormatOpenAI, FormatOpenAIResponse, type Format, type TranslateContext, type TranslatorState } from "../../translator/types.ts";
 import { StatusError } from "../types.ts";
+import { applyPatchTranslationError, applyPatchUpstreamError, ensureResponsesUsageDetails, finalizeApplyPatchStream, initializeApplyPatchStream } from "../responses.ts";
 import {
   geminiPromptBlockErrorMessage,
   geminiStreamHasFinishSignal,
@@ -104,11 +108,16 @@ export interface GeminiStreamOptions {
 export async function* geminiStreamChunks(o: GeminiStreamOptions): AsyncGenerator<string> {
   const state: TranslatorState = {};
   const ctx: TranslateContext = o.ctx ?? { signal: o.signal };
-  const translate = (chunk: string): string[] =>
-    defaultRegistry.translateStream(ctx, FormatGemini, o.responseFormat, o.model, o.originalRequest, o.translatedRequest, chunk, state);
+  const translate = (chunk: string): string[] => {
+    const out = defaultRegistry.translateStream(ctx, FormatGemini, o.responseFormat, o.model, o.originalRequest, o.translatedRequest, chunk, state);
+    // Go: TranslateStreamWithClaudeInputTokens completes Responses usage details on every chunk.
+    if (o.responseFormat !== FormatOpenAIResponse || applyPatchTranslationError(state)) return out;
+    return out.map(ensureResponsesUsageDetails);
+  };
   let sawFinish = false;
   let emitted = false;
   let retained: StatusError | undefined;
+  initializeApplyPatchStream(ctx, FormatGemini, o.responseFormat, o.model, o.originalRequest, o.translatedRequest, state);
 
   const capture = (lines: string[]): void => {
     if (retained) return;
@@ -141,12 +150,19 @@ export async function* geminiStreamChunks(o: GeminiStreamOptions): AsyncGenerato
         emitted = true;
         yield out;
       }
+      if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
     }
   } catch (err) {
     if (o.signal?.aborted) return;
     throw err;
   }
   if (o.signal?.aborted) return;
+  for (const out of finalizeApplyPatchStream(state)) {
+    if (out === "") continue;
+    emitted = true;
+    yield out;
+  }
+  if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
   if (retained) throw retained;
 
   if (o.missingFinish === "truncate" && !sawFinish && (o.responseFormat === FormatClaude || o.responseFormat === FormatOpenAI)) {
@@ -163,6 +179,7 @@ export async function* geminiStreamChunks(o: GeminiStreamOptions): AsyncGenerato
     emitted = true;
     yield out;
   }
+  if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
   if (retained) throw retained;
   if (o.missingFinish === "flush" && !emitted) {
     throw new StatusError(502, "upstream stream closed before first payload");

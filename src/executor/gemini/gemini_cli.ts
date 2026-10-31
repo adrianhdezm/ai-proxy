@@ -14,7 +14,8 @@ import { SingleFlight } from "../../auth/oauth/singleflight.ts";
 import type { Auth } from "../../auth/types.ts";
 import { wrapGeminiCLIRequest } from "../../translator/gemini/claude/index.ts";
 import { defaultRegistry } from "../../translator/registry.ts";
-import { FormatGemini, type TranslatorState, toolInputFailed } from "../../translator/types.ts";
+import { FormatGemini, FormatOpenAIResponse, type TranslatorState, toolInputFailed } from "../../translator/types.ts";
+import { applyPatchTranslationError, applyPatchUpstreamError, ensureResponsesUsageDetails } from "../responses.ts";
 import { applyCustomHeadersFromAttrs } from "../../util/header_helpers.ts";
 import { getAt, gint, isObj } from "../../util/gpath.ts";
 import { tryParse } from "../../util/json.ts";
@@ -230,10 +231,12 @@ export class GeminiCLIExecutor implements ProviderExecutor {
       const data = await resp.text();
       if (resp.status >= 200 && resp.status < 300) {
         const state: TranslatorState = {};
-        const out = defaultRegistry.translateNonStream({ signal: opts.signal }, FormatGemini, responseFormat, req.model, originalRequestOf(req, opts), body, data, state);
+        let out = defaultRegistry.translateNonStream({ signal: opts.signal }, FormatGemini, responseFormat, req.model, originalRequestOf(req, opts), body, data, state);
+        if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
         const errPayload = translatedClaudeErrorPayload(responseFormat, out);
         if (errPayload !== undefined) throw new StatusError(502, errPayload, { body: errPayload });
         if (out === "" || toolInputFailed(state)) throw new StatusError(502, "gemini-cli executor: empty translated response");
+        if (responseFormat === FormatOpenAIResponse) out = ensureResponsesUsageDetails(out);
         return { payload: out, headers: resp.headers, metadata: { usage: parseGeminiCLIUsage(data) } };
       }
       lastStatus = resp.status;

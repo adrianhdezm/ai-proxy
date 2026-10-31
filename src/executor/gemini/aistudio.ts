@@ -14,7 +14,8 @@
 import "../../translator/gemini/claude/index.ts";
 import { type Auth, AttributeAPIKey, AttributeBaseURL } from "../../auth/types.ts";
 import { defaultRegistry } from "../../translator/registry.ts";
-import { FormatGemini, type TranslatorState, toolInputFailed } from "../../translator/types.ts";
+import { FormatGemini, FormatOpenAIResponse, type TranslatorState, toolInputFailed } from "../../translator/types.ts";
+import { applyPatchTranslationError, applyPatchUpstreamError, ensureResponsesUsageDetails } from "../responses.ts";
 import { applyCustomHeadersFromAttrs } from "../../util/header_helpers.ts";
 import { getAt, gint } from "../../util/gpath.ts";
 import { tryParse } from "../../util/json.ts";
@@ -153,10 +154,12 @@ export class AIStudioExecutor implements ProviderExecutor {
     const blockMsg = geminiPromptBlockErrorMessage(data);
     if (blockMsg !== undefined) throw newGeminiPromptBlockErr(blockMsg);
     const state: TranslatorState = {};
-    const out = defaultRegistry.translateNonStream({ signal: opts.signal }, FormatGemini, responseFormat, req.model, originalRequestOf(req, opts), body, data, state);
+    let out = defaultRegistry.translateNonStream({ signal: opts.signal }, FormatGemini, responseFormat, req.model, originalRequestOf(req, opts), body, data, state);
+    if (applyPatchTranslationError(state)) throw applyPatchUpstreamError();
     if (toolInputFailed(state) || out === "") throw new StatusError(502, "aistudio executor: empty translated response");
     const errPayload = translatedClaudeErrorPayload(responseFormat, out);
     if (errPayload !== undefined) throw new StatusError(502, errPayload, { body: errPayload });
+    if (responseFormat === FormatOpenAIResponse) out = ensureResponsesUsageDetails(out);
     return { payload: out, headers: resp.headers, metadata: { usage: parseGeminiUsage(data) } };
   }
 
