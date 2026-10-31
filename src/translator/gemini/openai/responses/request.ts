@@ -411,7 +411,7 @@ export function convertOpenAIResponsesRequestToGemini(modelName: string, inputRa
   const stopSequences = getAt(root, "stop_sequences");
   if (isArr(stopSequences)) genConfig().stopSequences = stopSequences.map((seq) => gstr(seq));
 
-  applyOpenAIResponsesTextFormatToGemini(out, root, genConfig);
+  applyOpenAIResponsesTextFormatToGemini(root, genConfig);
 
   // reasoning.effort -> thinkingConfig (translation-only; capability checks happen in ApplyThinking).
   const re = getAt(root, "reasoning.effort");
@@ -595,7 +595,7 @@ export function pairOpenAIResponsesReasoningWithFunctionCalls(items: unknown[]):
   return paired;
 }
 
-function reorderOpenAIResponsesDetachedReasoning(items: unknown[]): unknown[] {
+export function reorderOpenAIResponsesDetachedReasoning(items: unknown[]): unknown[] {
   const reordered: unknown[] = [];
   items.forEach((item, itemIndex) => {
     const isReasoningCarrier = isOpenAIResponsesDetachedCarrier(item);
@@ -1331,7 +1331,7 @@ function openAIResponsesGeminiThoughtSignature(rawSignature: string): string {
   return compatibleSignatureForProviderBlock(SignatureProviderGemini, rawSignature, SignatureBlockKindGeminiModelPart) ?? "";
 }
 
-function applyOpenAIResponsesTextFormatToGemini(out: Obj, root: unknown, genConfig: () => Obj): void {
+function applyOpenAIResponsesTextFormatToGemini(root: unknown, genConfig: () => Obj): void {
   const textFormat = getAt(root, "text.format");
   if (textFormat === undefined) return;
   const formatType = str(textFormat, "type").trim().toLowerCase();
@@ -1347,5 +1347,4 @@ function applyOpenAIResponsesTextFormatToGemini(out: Obj, root: unknown, genConf
       break;
     }
   }
-  void out;
 }

@@ -12,11 +12,6 @@ function send(request: string, raw: string, state: TranslatorState, model = "gem
   return streamChunk(model, request, "", raw, state).map(parseSSEEvent);
 }
 
-function toolInputError(state: TranslatorState): Error | undefined {
-  const v = state.value as { toolInputError?: () => Error | undefined } | undefined;
-  return v?.toolInputError?.();
-}
-
 describe("apply_patch_test.go", () => {
   test("TestGeminiApplyPatchCompleteArgumentsLifecycle", () => {
     const state: TranslatorState = {};
