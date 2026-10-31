@@ -1,5 +1,5 @@
 // Ported from: test/codex_stream_disconnect_failover_test.go
-// Skipped cases: the "buffered" sub-cases (bootstrap buffering not ported). Adaptations: Claude Messages
+// Skipped cases: none (the "buffered" sub-cases run with streamBootstrapBuffering: true). Adaptations: Claude Messages
 //   inbound requests (Go used openai-response), so payload checks look for the translated text and
 //   message_stop; TestCodexStreamDisconnectExhaustionNotInvalidRequestError formats the surfaced error with the
 //   server's Claude error envelope (src/server/errors.ts) instead of driving the gin /v1/responses handler,
@@ -23,7 +23,7 @@ const run = async (harness: ReturnType<typeof codexManager>) => {
   return { body: chunks.join(""), error };
 };
 
-describe("TestCodexStreamDisconnectAfterHeadersFailsOver/unbuffered", () => {
+for (const buffering of [false, true]) describe(`TestCodexStreamDisconnectAfterHeadersFailsOver/${buffering ? "buffered" : "unbuffered"}`, () => {
   const attempts: string[] = [];
   const upstream = startUpstream((req) => {
     const account = accountOf(req);
@@ -36,9 +36,9 @@ describe("TestCodexStreamDisconnectAfterHeadersFailsOver/unbuffered", () => {
         `data: {"type":"response.completed","response":{"id":"resp_b","status":"completed","output":[]}}\n\n`,
     );
   });
-  const harness = codexManager({ requestRetry: 0, maxRetryCredentials: 2 });
-  harness.addAuth("codex-failover-a", "account-a", upstream.url, { priority: 100, disableCooling: true, models: [model] });
-  harness.addAuth("codex-failover-b", "account-b", upstream.url, { priority: 0, disableCooling: true, models: [model] });
+  const harness = codexManager({ requestRetry: 0, maxRetryCredentials: 2 }, { streamBootstrapBuffering: buffering });
+  harness.addAuth(`codex-failover-a-${buffering}`, "account-a", upstream.url, { priority: 100, disableCooling: true, models: [model] });
+  harness.addAuth(`codex-failover-b-${buffering}`, "account-b", upstream.url, { priority: 0, disableCooling: true, models: [model] });
   afterAll(() => {
     harness.cleanup();
     upstream.close();
@@ -75,7 +75,7 @@ describe("TestCodexStreamDisconnectExhaustionNotInvalidRequestError", () => {
   });
 });
 
-describe("TestCodexStreamDisconnectAfterOutputDoesNotFailOver/unbuffered", () => {
+for (const buffering of [false, true]) describe(`TestCodexStreamDisconnectAfterOutputDoesNotFailOver/${buffering ? "buffered" : "unbuffered"}`, () => {
   const attempts: string[] = [];
   const upstream = startUpstream((req) => {
     attempts.push(accountOf(req));
@@ -85,9 +85,9 @@ describe("TestCodexStreamDisconnectAfterOutputDoesNotFailOver/unbuffered", () =>
         `data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg_a","delta":"MOCK_A_PARTIAL"}\n\n`,
     );
   });
-  const harness = codexManager({ requestRetry: 0, maxRetryCredentials: 2 });
-  harness.addAuth("codex-partial-a", "account-a", upstream.url, { priority: 100, disableCooling: true, models: [model] });
-  harness.addAuth("codex-partial-b", "account-b", upstream.url, { priority: 0, disableCooling: true, models: [model] });
+  const harness = codexManager({ requestRetry: 0, maxRetryCredentials: 2 }, { streamBootstrapBuffering: buffering });
+  harness.addAuth(`codex-partial-a-${buffering}`, "account-a", upstream.url, { priority: 100, disableCooling: true, models: [model] });
+  harness.addAuth(`codex-partial-b-${buffering}`, "account-b", upstream.url, { priority: 0, disableCooling: true, models: [model] });
   afterAll(() => {
     harness.cleanup();
     upstream.close();

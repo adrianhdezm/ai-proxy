@@ -541,7 +541,7 @@ class CodexLineSource {
   readonly scanner = new CodexSSEScanner({ onDiagnostic: logSSEDiagnostic });
   /** A transport error that ended the body (Go: scanner.Err()). */
   readError: unknown;
-  private reader?: ReadableStreamDefaultReader<Uint8Array>;
+  private reader?: ReturnType<typeof defaultReader>;
   private lines: string[] = [];
   private lineIndex = 0;
   private items: CodexSSEItem[] = [];
@@ -585,14 +585,15 @@ class CodexLineSource {
       this.drained = true;
       return;
     }
-    if (!this.reader) {
-      this.reader = this.body.getReader();
+    let reader = this.reader;
+    if (!reader) {
+      reader = this.reader = defaultReader(this.body);
       this.signal?.addEventListener("abort", this.onAbort, { once: true });
       if (this.signal?.aborted) this.onAbort();
     }
-    let result: Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>;
+    let result: Awaited<ReturnType<typeof reader.read>>;
     try {
-      result = await this.reader.read();
+      result = await reader.read();
     } catch (err) {
       this.readError = err;
       this.ended = true;
@@ -624,6 +625,10 @@ class CodexLineSource {
       // already released
     }
   }
+}
+
+function defaultReader(body: ReadableStream<Uint8Array>) {
+  return body.getReader();
 }
 
 function abortReason(signal: AbortSignal): unknown {

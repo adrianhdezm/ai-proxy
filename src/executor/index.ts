@@ -27,6 +27,8 @@ export function createExecutors(config: Config): ProviderExecutor[] {
     createCodexExecutor({
       modelLevelCooling: config.upstream.codex.modelLevelCooling,
       disableCloaking: config.upstream.codex.disableCloaking,
+      streamBootstrapBuffering: config.upstream.codex.streamBootstrapBuffering,
+      streamBootstrapTimeoutMs: config.upstream.codex.streamBootstrapTimeoutMs,
     }),
     createGeminiCLIExecutor({ proxyUrl, switchPreviewModel: config.quotaExceeded.switchPreviewModel }),
     createAIStudioExecutor({ proxyUrl }),
