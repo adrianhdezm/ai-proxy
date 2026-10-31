@@ -4,16 +4,19 @@
 // claude_executor_auth.go, reduced to the kept request pipeline:
 //
 //   parseSuffix -> translate (identity for Claude inbound) -> model -> tool_choice
-//   -> thinking -> [rebuild mid-system] -> cloaking -> max_tokens -> forced tool
-//   choice -> sampling -> cache_control (ensure/limit/ttl) -> stream flag ->
-//   signature sanitising -> CLI identity -> betas lifted from body -> mid-system
-//   validation -> headers -> POST
+//   [thinking replay restore] -> parseSuffix -> translate (identity for Claude
+//   inbound) -> model -> tool_choice -> thinking -> [rebuild mid-system] ->
+//   cloaking (billing header, currentDate, continuity) -> context_management /
+//   diagnostics (cloaked + api.anthropic.com) -> max_tokens -> forced tool
+//   choice -> context_management reconcile -> sampling -> cache_control
+//   (ensure/limit/ttl) -> stream flag -> signature sanitising -> CLI identity ->
+//   CCH placeholder -> betas lifted from body -> CCH signing (last mutation) ->
+//   mid-system validation -> headers -> POST -> continuity commit / replay cache
 //
-// Skipped from upstream (see the slice report): CCH signing, diagnostics and
-// context_management injection, MCP alias remapping, web-search result cache,
-// thinking replay cache, compaction, tool_search fallback, fast-mode error
-// wrappers, usage reporting plugins, payload config rules, preserved-thinking
-// block binding, local token estimation and the OAuth profile prefetch.
+// Skipped from upstream (see the slice report): MCP alias remapping, web-search
+// result cache, compaction, tool_search fallback, fast-mode error wrappers,
+// usage reporting plugins, payload config rules, preserved-thinking block
+// binding, local token estimation and the OAuth profile prefetch.
 import { ClaudeAuthenticator } from "../../auth/claude/authenticator.ts";
 import { type Auth, isAPIKeyAuth } from "../../auth/types.ts";
 import { log } from "../../log.ts";
@@ -48,6 +51,24 @@ import {
   validateClaudeMidSystemMessageModel,
 } from "./cloaking.ts";
 import type { ClaudeHeaderDefaults } from "./device_profile.ts";
+import { ClaudeContinuityStore, type ClaudeDiagnosticsRequestState, commitClaudeContinuity, defaultClaudeContinuityStore, emptyClaudeDiagnosticsState, injectClaudeDiagnostics, injectClaudeDiagnosticsWithState, newClaudeContinuityContext } from "./diagnostics.ts";
+import { type ClaudeRequestContext, claudeCCHFallbackBillingHeader, defaultClaudeSessionDatePinDays } from "./billing.ts";
+import { type ClaudeCodeContextManagementState, injectClaudeCodeContextManagement, reconcileClaudeCodeContextManagement } from "./context_management.ts";
+import { ClaudeCCHUpstreamKind, claudeBodyNeedsBillingFallback, claudeCCHSigningEnabled, ensureClaudeBillingHeaderCCHPlaceholder, signAnthropicMessagesBody } from "./signing.ts";
+import {
+  type ClaudeThinkingReplayScope,
+  ExecutionSessionMetadataKey,
+  apiKeyModelIsCompat,
+  cacheClaudeThinkingReplayResponse,
+  claudeThinkingReplayEnabled,
+  claudeThinkingReplayScopeValid,
+  clearClaudeThinkingReplayContent,
+  emptyClaudeThinkingReplayScope,
+  prepareClaudeThinkingReplayRequest,
+  shouldClearThinkingReplayAfterError,
+  wrapClaudeThinkingReplayStream,
+} from "./thinking_replay.ts";
+import { ClaudeThinkingReplayCache, defaultClaudeThinkingReplayCache } from "../../cache/claude_thinking_replay_cache.ts";
 import { classifyClaudeUpstreamErrorWithCooling } from "./errors.ts";
 import { applyClaudeHeaders } from "./headers.ts";
 import { applyClaudeCLIIdentity, claudeAgentSessionUUIDForRequest, validateClaudeMetadataUnique } from "./identity.ts";
@@ -64,6 +85,8 @@ import {
 import { claudeSubagentRequests1h, isClaudeProbeOrHelperRequest, isClaudeSubagentRequest } from "./request_shape.ts";
 import {
   type ClaudeStreamState,
+  claudeMessageIDFromResponse,
+  claudeMessageIDFromSSE,
   claudeResponseContentEncoding,
   decodeResponseBody,
   newClaudeStreamState,
@@ -73,7 +96,8 @@ import {
   restoreClaudeResponseModel,
   validateClaudeStreamingResponse,
 } from "./response.ts";
-import { DefaultClaudeBaseURL, claudeCreds, isAnthropicUpstreamBase } from "./upstream.ts";
+import { DefaultClaudeBaseURL, claudeCreds, headerValueCaseInsensitive, isAnthropicUpstreamBase } from "./upstream.ts";
+import { defaultClaudeVersion } from "./device_profile.ts";
 
 export type FetchLike = (input: string, init?: RequestInit & { proxy?: string; decompress?: boolean }) => Promise<Response>;
 
@@ -94,8 +118,17 @@ export interface ClaudeExecutorConfig {
   proxyUrl?: string;
   /** fetch used for upstream calls (tests). */
   fetch?: FetchLike;
-  /** Clock for rate-limit deadlines (tests). */
+  /** Clock for rate-limit deadlines, the currentDate reminder, continuity and replay TTLs (tests). */
   now?: () => number;
+  /**
+   * Days a cloaked session keeps its currentDate pin; 0 = continuity-scoped
+   * (1h) pin. Default 7 (upstream claude.session-date-pin-days).
+   */
+  sessionDatePinDays?: number;
+  /** Per-session continuity state; defaults to the process-wide store (or a private one when `now` is set). */
+  continuityStore?: ClaudeContinuityStore;
+  /** Thinking replay cache; defaults to the process-wide cache (or a private one when `now` is set). */
+  thinkingReplayCache?: ClaudeThinkingReplayCache;
   /** Optional upstream model rewrite; when set the requested model is written back into responses. */
   upstreamModelNormalizer?: (baseModel: string) => string;
 }
@@ -107,11 +140,30 @@ export class ClaudeExecutor implements ProviderExecutor {
   private readonly cfg: ClaudeExecutorConfig;
   private readonly fetchImpl: FetchLike;
   private readonly now: () => number;
+  readonly continuity: ClaudeContinuityStore;
+  readonly replayCache: ClaudeThinkingReplayCache;
 
   constructor(cfg: ClaudeExecutorConfig = {}) {
     this.cfg = cfg;
     this.fetchImpl = cfg.fetch ?? ((input, init) => fetch(input, init));
     this.now = cfg.now ?? (() => Date.now());
+    this.continuity = cfg.continuityStore ?? (cfg.now ? new ClaudeContinuityStore(cfg.now) : defaultClaudeContinuityStore);
+    this.replayCache = cfg.thinkingReplayCache ?? (cfg.now ? new ClaudeThinkingReplayCache({ now: cfg.now }) : defaultClaudeThinkingReplayCache);
+  }
+
+  private sessionDatePinRetentionMs(): number {
+    const days = this.cfg.sessionDatePinDays ?? defaultClaudeSessionDatePinDays;
+    return days > 0 ? days * 24 * 60 * 60_000 : 0;
+  }
+
+  /** Restores dropped thinking for compat API-key models (Go: prepareClaudeThinkingReplayRequest). */
+  private prepareReplay(auth: Auth, req: ExecRequest, opts: ExecOptions): { req: ExecRequest; scope: ClaudeThinkingReplayScope } {
+    if (!claudeThinkingReplayEnabled(auth, req, opts)) return { req, scope: emptyClaudeThinkingReplayScope() };
+    return prepareClaudeThinkingReplayRequest(this.replayCache, auth, req, opts);
+  }
+
+  private clearReplayAfterError(scope: ClaudeThinkingReplayScope, err: unknown): void {
+    if (scope.replayApplied && shouldClearThinkingReplayAfterError(err)) clearClaudeThinkingReplayContent(this.replayCache, scope);
   }
 
   private modelLevelCooling(): boolean {
@@ -152,7 +204,12 @@ export class ClaudeExecutor implements ProviderExecutor {
    * Runs the shared request pipeline and returns everything the transport needs.
    * `upstreamStream` selects the SSE transport (always true for executeStream).
    */
-  private prepare(auth: Auth, req: ExecRequest, opts: ExecOptions, upstreamStream: boolean): { url: string; headers: Headers; body: string; bodyForTranslation: string; originalPayload: string } {
+  private prepare(
+    auth: Auth,
+    req: ExecRequest,
+    opts: ExecOptions,
+    upstreamStream: boolean,
+  ): { url: string; headers: Headers; body: string; bodyForTranslation: string; originalPayload: string; diagnostics: ClaudeDiagnosticsRequestState } {
     const baseModel = parseSuffix(req.model).modelName;
     const upstreamModel = this.upstreamModel(baseModel);
     const { apiKey, baseURL: configuredBase } = claudeCreds(auth);
@@ -168,6 +225,21 @@ export class ClaudeExecutor implements ProviderExecutor {
     const sessionID = fp.profileClaudeCodeCLI || wirePolicy.cloak ? claudeAgentSessionUUIDForRequest(incomingHeaders, originalPayload, req.payload, confirmedClaudeCode, opts.metadata, req.metadata) : "";
     // The credential identity rewrite must see the only metadata object the caller sent.
     if (fp.applyCLIIdentity) validateClaudeMetadataUnique(req.payload);
+    // Real Claude OAuth always signs CCH; an opted-in API key signs only on api.anthropic.com.
+    const cchSigning = claudeCCHSigningEnabled(apiKey, ClaudeCCHUpstreamKind.Anthropic, fp.profileClaudeCodeCLI, url);
+    const directAnthropic = isAnthropicUpstreamBase(baseURL);
+    const injectDiagnostics = fp.profileClaudeCodeCLI && this.cfg.headerDefaults?.injectDiagnostics !== false;
+    const rc: ClaudeRequestContext = {
+      store: this.continuity,
+      incomingHeaders,
+      sessionID: fp.profileClaudeCodeCLI ? sessionID : "",
+      hasExecutionMetadata: claudeRequestHasExecutionMetadata(opts.metadata, req.metadata),
+      continuity: newClaudeContinuityContext(),
+      workload: headerValueCaseInsensitive(incomingHeaders, "X-CPA-Claude-Workload").trim(),
+      now: this.now,
+      sessionDatePinRetentionMs: this.sessionDatePinRetentionMs(),
+      timezone: this.cfg.headerDefaults?.timezone ?? "",
+    };
 
     let body = translateRequest(from, to, baseModel, req.payload, upstreamStream);
     body = setStringIfDifferent(body, "model", upstreamModel);
@@ -175,13 +247,44 @@ export class ClaudeExecutor implements ProviderExecutor {
     body = applyRequestThinking(body, req, opts, from, to, this.identifier);
     if (this.cfg.rebuildMidSystemMessage) body = rebuildMidSystemMessagesToTopLevel(body);
 
+    let isProbeOrHelper = isClaudeProbeOrHelperRequest(body);
     const explicitCacheMode = isExplicitPromptCacheMode(originalPayload, req.payload, body);
-    const cloak = applyCloaking(this.cfg, auth, body, apiKey, confirmedClaudeCode, { explicitCacheMode, sessionID });
+    const cloak = applyCloaking(this.cfg, auth, body, apiKey, confirmedClaudeCode, {
+      explicitCacheMode,
+      sessionID,
+      cchSigning,
+      billingVersion: defaultClaudeVersion(this.cfg.headerDefaults),
+      rc,
+    });
     body = cloak.payload;
     const cloaked = cloak.cloaked;
 
+    // Only Messages on Anthropic itself carries context_management / diagnostics.
+    let diagnostics = emptyClaudeDiagnosticsState();
+    if (!isProbeOrHelper) isProbeOrHelper = isClaudeProbeOrHelperRequest(body);
+    const continuity = rc.continuity;
+    if (continuity.initialized) diagnostics = { key: continuity.key, sequence: continuity.sequence, promptID: continuity.promptID };
+    const cmState: ClaudeCodeContextManagementState = {
+      eligible: cloaked && directAnthropic,
+      callerOwned: getAt(tryParse(body), "context_management") !== undefined,
+      automaticallyInjected: false,
+    };
+    if (cmState.eligible) {
+      const cm = injectClaudeCodeContextManagement(body);
+      body = cm.payload;
+      cmState.automaticallyInjected = cm.injected;
+      if (injectDiagnostics && !isProbeOrHelper) {
+        const injected = continuity.initialized
+          ? injectClaudeDiagnosticsWithState(body, continuity.key, continuity.sequence, continuity.previousMessageID, continuity.promptID)
+          : injectClaudeDiagnostics(this.continuity, body, auth, sessionID);
+        body = injected.body;
+        diagnostics = injected.state;
+      }
+    }
+
     body = ensureModelMaxTokens(body, baseModel);
     body = disableThinkingIfToolChoiceForced(body);
+    body = reconcileClaudeCodeContextManagement(body, cmState);
     body = normalizeClaudeSamplingForUpstream(body, confirmedClaudeCode);
 
     // Default cache_control for non-native callers; confirmed native Claude Code owns its markers.
@@ -191,7 +294,6 @@ export class ClaudeExecutor implements ProviderExecutor {
     body = stripPromptCacheOptions(body);
 
     // Native selects the 1h cache pool only for OAuth credentials and pairs it with extended-cache-ttl.
-    const isProbeOrHelper = isClaudeProbeOrHelperRequest(body);
     const isSubagent = isClaudeSubagentRequest(incomingHeaders, body);
     const subagent1h = isSubagent && claudeSubagentRequests1h(incomingHeaders, body);
     if (cpaOwnsCacheControl && fp.profileClaudeCodeCLI && (!isSubagent || subagent1h) && !isProbeOrHelper) {
@@ -203,12 +305,21 @@ export class ClaudeExecutor implements ProviderExecutor {
     body = setBoolIfDifferent(body, "stream", upstreamStream);
 
     const bodyForTranslation = body;
-    let bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(body, baseModel);
+    let bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(body, baseModel, apiKeyModelIsCompat(req));
     if (fp.applyCLIIdentity) bodyForUpstream = applyClaudeCLIIdentity(bodyForUpstream, auth, apiKey, sessionID, fp.synthesizeIdentity);
+    if (cchSigning) {
+      let cchBilling = "";
+      if (!detection.helperProfile || claudeBodyNeedsBillingFallback(bodyForUpstream)) {
+        cchBilling = claudeCCHFallbackBillingHeader(rc, defaultClaudeVersion(this.cfg.headerDefaults), bodyForUpstream, detection.entrypoint);
+      }
+      bodyForUpstream = ensureClaudeBillingHeaderCCHPlaceholder(bodyForUpstream, cchBilling);
+    }
     const lifted = extractAndRemoveBetas(bodyForUpstream);
     bodyForUpstream = stripPromptCacheOptions(lifted.body);
+    // CCH covers the final serialized body, so signing is the last mutation.
+    if (cchSigning) bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream);
     // Read-only validation must observe the final model and messages.
-    validateClaudeMidSystemMessageModel(bodyForUpstream, confirmedClaudeCode, isAnthropicUpstreamBase(baseURL));
+    validateClaudeMidSystemMessageModel(bodyForUpstream, confirmedClaudeCode, directAnthropic);
 
     const headers = new Headers();
     applyClaudeHeaders({
@@ -224,10 +335,20 @@ export class ClaudeExecutor implements ProviderExecutor {
       confirmedClaudeCode: confirmedClaudeCode && !cloaked,
       sessionID,
     });
-    return { url, headers, body: bodyForUpstream, bodyForTranslation, originalPayload };
+    return { url, headers, body: bodyForUpstream, bodyForTranslation, originalPayload, diagnostics };
   }
 
   async execute(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
+    const replay = this.prepareReplay(auth, req, opts);
+    try {
+      return await this.executeInner(auth, replay.req, opts, replay.scope);
+    } catch (err) {
+      this.clearReplayAfterError(replay.scope, err);
+      throw err;
+    }
+  }
+
+  private async executeInner(auth: Auth, req: ExecRequest, opts: ExecOptions, replayScope: ClaudeThinkingReplayScope): Promise<ExecResponse> {
     const responseFormat = responseFormatOrSource(opts);
     // Native Claude responses use the JSON path; other response formats need the
     // upstream event stream so the registered translator can aggregate it.
@@ -236,8 +357,16 @@ export class ClaudeExecutor implements ProviderExecutor {
     const res = await this.send(prepared.url, prepared.headers, prepared.body, auth, opts);
     if (res.status < 200 || res.status >= 300) throw await this.upstreamError(res);
     let data = await readAllText(decodeResponseBody(res.body, claudeResponseContentEncoding(res.headers)));
-    if (upstreamStream) validateClaudeStreamingResponse(data);
+    const requestID = headerValueCaseInsensitive(res.headers, "request-id");
+    if (upstreamStream) {
+      validateClaudeStreamingResponse(data);
+      const messageID = claudeMessageIDFromSSE(data);
+      if (messageID !== "") commitClaudeContinuity(this.continuity, prepared.diagnostics, messageID, requestID);
+    } else {
+      commitClaudeContinuity(this.continuity, prepared.diagnostics, claudeMessageIDFromResponse(data), requestID);
+    }
     data = this.restoreResponseModel(data, req.model);
+    cacheClaudeThinkingReplayResponse(this.replayCache, replayScope, data);
     const state: TranslatorState = {};
     const out = translateNonStream({ signal: opts.signal }, to, responseFormat, req.model, prepared.originalPayload, prepared.bodyForTranslation, data, state);
     if (out.length === 0) throw new StatusError(502, "claude executor: response translation produced no output");
@@ -247,6 +376,18 @@ export class ClaudeExecutor implements ProviderExecutor {
   }
 
   async executeStream(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<StreamResult> {
+    const replay = this.prepareReplay(auth, req, opts);
+    let result: StreamResult;
+    try {
+      result = await this.executeStreamInner(auth, replay.req, opts);
+    } catch (err) {
+      this.clearReplayAfterError(replay.scope, err);
+      throw err;
+    }
+    return claudeThinkingReplayScopeValid(replay.scope) ? wrapClaudeThinkingReplayStream(this.replayCache, result, replay.scope) : result;
+  }
+
+  private async executeStreamInner(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<StreamResult> {
     const responseFormat = responseFormatOrSource(opts);
     const prepared = this.prepare(auth, req, opts, true);
     const res = await this.send(prepared.url, prepared.headers, prepared.body, auth, opts);
@@ -254,7 +395,13 @@ export class ClaudeExecutor implements ProviderExecutor {
     const decoded = decodeResponseBody(res.body, claudeResponseContentEncoding(res.headers));
     const restore = (frame: string): string => this.restoreResponseModel(frame, req.model);
     const signal = opts.signal;
-    const chunks = responseFormat === to ? passthroughChunks(decoded, restore, signal) : translatedChunks(decoded, restore, signal, responseFormat, req.model, prepared.originalPayload, prepared.bodyForTranslation);
+    const requestID = headerValueCaseInsensitive(res.headers, "request-id");
+    // Continuity advances only once the upstream stream reached message_stop.
+    const onComplete = (state: ClaudeStreamState): void => commitClaudeContinuity(this.continuity, prepared.diagnostics, state.messageID, requestID);
+    const chunks =
+      responseFormat === to
+        ? passthroughChunks(decoded, restore, signal, onComplete)
+        : translatedChunks(decoded, restore, signal, responseFormat, req.model, prepared.originalPayload, prepared.bodyForTranslation, onComplete);
     return { headers: res.headers, chunks };
   }
 
@@ -322,6 +469,11 @@ export class ClaudeExecutor implements ProviderExecutor {
   }
 }
 
+/** Whether the request carried execution session metadata (Go: ClaudeRequestHasExecutionMetadata). */
+function claudeRequestHasExecutionMetadata(...metadataSets: Array<Record<string, unknown> | undefined>): boolean {
+  return metadataSets.some((m) => typeof m?.[ExecutionSessionMetadataKey] === "string" && (m[ExecutionSessionMetadataKey] as string).trim() !== "");
+}
+
 /** Creates the Claude executor (Go: NewClaudeExecutor). */
 export function createClaudeExecutor(cfg: ClaudeExecutorConfig = {}): ClaudeExecutor {
   return new ClaudeExecutor(cfg);
@@ -337,15 +489,23 @@ function truncationError(): StatusError {
 }
 
 /** Terminal check shared by both stream modes; throws the error event's status or a truncation error. */
-function finishStream(state: ClaudeStreamState, signal: AbortSignal | undefined): void {
-  if (state.completed) return;
+function finishStream(state: ClaudeStreamState, signal: AbortSignal | undefined, onComplete?: (state: ClaudeStreamState) => void): void {
+  if (state.completed) {
+    onComplete?.(state);
+    return;
+  }
   if (state.streamErr) throw state.streamErr;
   if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError");
   throw truncationError();
 }
 
 /** Forwards complete upstream SSE events verbatim (Go: ExecuteStream, responseFormat == to). */
-async function* passthroughChunks(decoded: ReadableStream<Uint8Array>, restore: (frame: string) => string, signal: AbortSignal | undefined): AsyncGenerator<string> {
+async function* passthroughChunks(
+  decoded: ReadableStream<Uint8Array>,
+  restore: (frame: string) => string,
+  signal: AbortSignal | undefined,
+  onComplete?: (state: ClaudeStreamState) => void,
+): AsyncGenerator<string> {
   const state = newClaudeStreamState();
   for await (const ev of iterateSSE(decoded, signal)) {
     const frame = restore(frameOf(ev.raw));
@@ -353,7 +513,7 @@ async function* passthroughChunks(decoded: ReadableStream<Uint8Array>, restore: 
     yield frame;
     if (state.completed || state.streamErr) break;
   }
-  finishStream(state, signal);
+  finishStream(state, signal, onComplete);
 }
 
 /** Translates each upstream event through the registry (Go: ExecuteStream, other response formats). */
@@ -365,6 +525,7 @@ async function* translatedChunks(
   model: string,
   originalPayload: string,
   bodyForTranslation: string,
+  onComplete?: (state: ClaudeStreamState) => void,
 ): AsyncGenerator<string> {
   const state = newClaudeStreamState();
   const translatorState: TranslatorState = {};
@@ -375,5 +536,5 @@ async function* translatedChunks(
     for (const out of outputs) yield out;
     if (state.completed || state.streamErr) break;
   }
-  finishStream(state, signal);
+  finishStream(state, signal, onComplete);
 }

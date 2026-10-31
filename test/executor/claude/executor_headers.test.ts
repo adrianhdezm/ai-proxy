@@ -1,6 +1,6 @@
 // Ported from: internal/runtime/executor/claude_executor_test.go
 // Skipped cases: this file holds the header and beta-assembly cases. TestClaudeExecutor_CacheTTLIsPairedWithExtendedCacheTTLBeta
-// reads system[0] instead of system[1] (no x-anthropic-billing-header block: CCH signing not ported). Dropped:
+// is ported in full. Dropped:
 // TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint, RejectsUnmeasuredClaudeCLIFingerprints,
 // DoesNotDowngradeConfiguredBaselineOnFirstClaudeClient, UpgradesCachedSoftwareFingerprintWhenBaselineAdvances,
 // LearnsOfficialFingerprintAfterCustomBaselineFallback, ThirdPartyBaselineThenOfficialUpgradeKeepsPinnedPlatform,
@@ -470,8 +470,8 @@ describe("executor header and cache-TTL policy", () => {
           await createClaudeExecutor().execute(auth, { model: "claude-opus-4-6", payload: `{"model":"claude-opus-4-6","messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]}`, format: "claude" }, claudeOpts());
           const body = lastBody(upstream);
           const betas = lastHeaders(upstream).get("Anthropic-Beta") ?? "";
-          expect(body.system[0].cache_control.ttl).toBe(tc.wantTTL);
-          expect(body.system[0].cache_control.type).toBe("ephemeral");
+          expect(body.system[1].cache_control.ttl).toBe(tc.wantTTL);
+          expect(body.system[1].cache_control.type).toBe("ephemeral");
           expect(betas.includes(claudeExtendedCacheTTLBeta)).toBe(tc.wantBeta);
         },
       );

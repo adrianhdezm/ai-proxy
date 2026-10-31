@@ -1,8 +1,8 @@
 // Ported from: internal/runtime/executor/claude_executor_test.go
 // Skipped cases: this file holds the request-pipeline cases (signature sanitising, web-search domains, sampling,
 // max_tokens, mid-system rebuild, cloaking/identity, caller system validation). TestClaudeExecutor_NonClaudeRequestUses
-// ClaudeCode220CLIFingerprint is reduced (no x-anthropic-billing-header block, no currentDate reminder: CCH signing and
-// the date reminder are not ported). Dropped here: TestApplyClaudeToolPrefix*, TestStripClaudeToolPrefix* (tool prefix
+// ClaudeCode220CLIFingerprint is ported in full here; the CCH, diagnostics, context_management and date-pin cases
+// live in cch_diagnostics.test.ts. Dropped here: TestApplyClaudeToolPrefix*, TestStripClaudeToolPrefix* (tool prefix
 // not ported), TestRemapOAuthToolNames*, TestReverseRemap*, TestPrepareClaudeOAuthToolNames*, TestResolveClaudeMCPAlias*,
 // *MCPAlias* (MCP alias remapping not ported), TestInjectClaudeCodeCurrentDate*, TestClaudeCodeLocalDate*,
 // TestClaudeCodeTimezone*, TestClaudeCallerCurrentDate*, TestApplyCloakingStringCallerReminder* (date reminder),
@@ -248,10 +248,16 @@ describe("cloaking and identity", () => {
         expect(h.get("X-App")).toBe("cli");
         expect(h.get("Anthropic-Beta")).toBe(claudeCodeCLIBetas(payload, undefined, false));
         expect(h.get("Anthropic-Beta") ?? "").not.toContain(claudeExtendedCacheTTLBeta);
-        expect(body.system).toHaveLength(1);
-        expect(body.system[0].text).toBe(claudeCodeCLIIdentity);
-        expect(body.system[0].cache_control.type).toBe("ephemeral");
-        expect(body.system[0].cache_control.ttl).toBeUndefined();
+        expect(body.system).toHaveLength(2);
+        expect(body.system[0].text).toBe("x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli;");
+        expect(body.system[1].text).toBe(claudeCodeCLIIdentity);
+        expect(body.system[1].cache_control.type).toBe("ephemeral");
+        expect(body.system[1].cache_control.ttl).toBeUndefined();
+        const content = body.messages[0].content;
+        expect(content).toHaveLength(2);
+        expect(content[0].text).toStartWith("<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is ");
+        expect(content[0].cache_control).toBeUndefined();
+        expect(content[1]).toEqual({ type: "text", text: "x", cache_control: { type: "ephemeral" } });
         const userID = body.metadata.user_id;
         expect(isValidUserID(userID)).toBe(true);
         expect(JSON.parse(userID).session_id).toBe(h.get("X-Claude-Code-Session-Id")!);
@@ -378,7 +384,9 @@ describe("cloaking and identity", () => {
         expect(h.get("x-api-key")).toBeNull();
         expect(h.get("User-Agent")).toStartWith("claude-cli/");
         expect(h.get("Anthropic-Beta") ?? "").toContain("oauth-2025-04-20");
-        expect(body.system[0].text).toBe(claudeCodeCLIIdentity);
+        expect(body.system[0].text).toStartWith("x-anthropic-billing-header: cc_version=2.1.280.");
+        expect(body.system[0].text).toMatch(/ cch=[0-9a-f]{5};/);
+        expect(body.system[1].text).toBe(claudeCodeCLIIdentity);
         expect(body.system.some((b: { text: string }) => b.text === "caller system")).toBe(true);
         const userID = JSON.parse(body.metadata.user_id);
         expect(userID.account_uuid).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
@@ -453,7 +461,10 @@ describe("caller system block validation", () => {
   test("ApplyCloakingStrictModeIgnoresNonTextCallerSystemBlock", () => {
     const auth = newAuth({ id: "o", provider: "claude", attributes: { cloak_strict_mode: "true" }, metadata: { access_token: "sk-ant-oat-x" } });
     const out = applyCloaking({ strictMode: true } as never, auth, `{"model":"claude-opus-4-6","system":[{"type":"image","source":{}}],"messages":[]}`, "sk-ant-oat-x", false);
-    expect(JSON.parse(out.payload).system).toEqual([{ type: "text", text: claudeCodeCLIIdentity, cache_control: { type: "ephemeral" } }]);
+    expect(JSON.parse(out.payload).system).toEqual([
+      { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli;" },
+      { type: "text", text: claudeCodeCLIIdentity, cache_control: { type: "ephemeral" } },
+    ]);
   });
 
   test("ExecuteRejectsNonTextCallerSystemBlockWithoutUpstream", async () => {

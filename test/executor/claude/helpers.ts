@@ -4,6 +4,7 @@
 import zlib from "node:zlib";
 import { type Auth, newAuth } from "../../../src/auth/types.ts";
 import type { ExecOptions, StreamResult } from "../../../src/executor/types.ts";
+import type { FetchLike } from "../../../src/executor/claude/executor.ts";
 import { StatusError } from "../../../src/executor/types.ts";
 import { type ApplyClaudeHeadersOptions, applyClaudeHeaders } from "../../../src/executor/claude/headers.ts";
 
@@ -188,4 +189,38 @@ export function lastHeaders(upstream: FakeUpstream): Headers {
   const last = upstream.requests[upstream.requests.length - 1];
   if (!last) throw new Error("no upstream request captured");
   return last.headers;
+}
+
+export interface CapturedFetch {
+  url: string;
+  headers: Headers;
+  body: string;
+}
+
+/**
+ * An in-process fetch stand-in (Go: roundTripperFunc on the request context) so
+ * tests can exercise the api.anthropic.com-only paths without any network.
+ */
+export function fakeFetch(handler: (req: CapturedFetch, call: number) => Response | Promise<Response>): { fetch: FetchLike; requests: CapturedFetch[] } {
+  const requests: CapturedFetch[] = [];
+  const fetchImpl: FetchLike = async (input, init) => {
+    const captured: CapturedFetch = { url: input, headers: new Headers(init?.headers), body: typeof init?.body === "string" ? init.body : "" };
+    requests.push(captured);
+    return handler(captured, requests.length);
+  };
+  return { fetch: fetchImpl, requests };
+}
+
+/** A minimal JSON Messages response with the given id, model and optional request-id header. */
+export function messageResponse(id: string, model = "claude-opus-5", requestID?: string, content = `[{"type":"text","text":"ok"}]`): Response {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (requestID) headers["request-id"] = requestID;
+  return new Response(`{"id":"${id}","type":"message","model":"${model}","role":"assistant","content":${content},"usage":{"input_tokens":1,"output_tokens":1}}`, { status: 200, headers });
+}
+
+/** Drains a stream, rethrowing its terminal error. */
+export async function drain(result: StreamResult): Promise<string[]> {
+  const chunks: string[] = [];
+  for await (const chunk of result.chunks) chunks.push(chunk);
+  return chunks;
 }
