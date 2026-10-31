@@ -13,30 +13,18 @@
 //
 // apply_patch bridging: only an executor-owned bridge stored in
 // TranslatorState.value enables it (Go: *ApplyPatchResponsesBridge in param).
-// A native Codex request never opts in. The bridge contract is structural so this
-// module does not depend on the bridge implementation:
-//   transform(event: string): string[]   JSON payloads without "data: "; a failure
-//                                        is returned as a response.failed payload and
-//                                        retained via toolInputError()
-//   transformNonStream(response: string): string   throws (or sets toolInputError) on failure
+// A native Codex request never opts in. The executor creates the bridge with
+// `new ApplyPatchResponsesBridge(originalRequest)` (common/apply_patch_responses.ts)
+// and stores it in TranslatorState.value before the first chunk; the bridge
+// retains its failure via toolInputError(), which the registry honours.
 import type { TranslateContext, TranslatorState } from "../../../types.ts";
 import { getAt, gstr, isArr, isObj } from "../../../../util/gpath.ts";
-import { requestModelName } from "../../../common/index.ts";
-
-/** Executor-owned apply_patch bridge (Go: *translatorcommon.ApplyPatchResponsesBridge). */
-export interface ResponsesBridge {
-  transform(event: string): string[] | { outputs: string[] };
-  transformNonStream(response: string): string;
-  toolInputError?(): Error | undefined;
-}
+import { requestModelName } from "../../../common/request.ts";
+import { ApplyPatchResponsesBridge } from "../../../common/apply_patch_responses.ts";
 
 /** Returns the executor-owned bridge held in the state, if any (Go: responsesBridge). */
-export function responsesBridge(state: TranslatorState | undefined): ResponsesBridge | undefined {
-  const value = state?.value as Partial<ResponsesBridge> | undefined;
-  if (value && typeof value === "object" && typeof value.transform === "function" && typeof value.transformNonStream === "function") {
-    return value as ResponsesBridge;
-  }
-  return undefined;
+export function responsesBridge(state: TranslatorState | undefined): ApplyPatchResponsesBridge | undefined {
+  return state?.value instanceof ApplyPatchResponsesBridge ? state.value : undefined;
 }
 
 /** Streams Codex Responses events to OpenAI Responses events (Go: ConvertCodexResponseToOpenAIResponses). */
@@ -59,8 +47,7 @@ export function convertCodexResponseToOpenAIResponses(
     if (updated === payload) return [originalEvent];
     return [sse ? "data: " + updated : updated];
   }
-  const result = bridge.transform(updated);
-  const outputs = Array.isArray(result) ? result : (result?.outputs ?? []);
+  const [outputs] = bridge.transform(updated);
   return sse ? outputs.map((output) => "data: " + output) : outputs;
 }
 
@@ -101,12 +88,9 @@ export function convertCodexResponseToOpenAIResponsesNonStream(
   const bridge = responsesBridge(state);
   let converted = rawJSON;
   if (bridge) {
-    try {
-      converted = bridge.transformNonStream(rawJSON);
-    } catch {
-      return "";
-    }
-    if (typeof converted !== "string" || bridge.toolInputError?.() !== undefined) return "";
+    const [out, errTransform] = bridge.transformNonStream(rawJSON);
+    if (errTransform) return "";
+    converted = out;
   }
   let root: unknown;
   try {

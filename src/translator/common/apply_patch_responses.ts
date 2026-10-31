@@ -34,7 +34,7 @@ export function normalizeApplyPatchResponsesRequest(raw: string): [string, Error
   const normalizeTools = (tools: unknown[], namespace: string): unknown[] => {
     const items: unknown[] = [];
     for (const tool of tools) {
-      let item = deepCopy(tool);
+      const item = deepCopy(tool);
       if (getAt(tool, "type") === "namespace") {
         for (const key of ["tools", "children"]) {
           const children = getAt(tool, key);
@@ -55,7 +55,6 @@ export function normalizeApplyPatchResponsesRequest(raw: string): [string, Error
             item.description = applyPatchDescription(tool);
             item.parameters = JSON.parse(applyPatchParameters());
             delete item.format;
-            item = { ...item };
           }
         }
       }
@@ -457,7 +456,6 @@ export class ApplyPatchResponsesBridge extends ApplyPatchErrorState {
     const root = tryParse<unknown>(raw) as JSONObject;
     let modified = false;
     const response = isObj(root) && exists(root.response) ? root.response : root;
-    const outputPath = isObj(root) && exists(root.response) ? "response.output" : "output";
     const output = garray(getAt(response, "output"));
     const originalLength = output.length;
     const preceding: string[] = [];
@@ -517,7 +515,6 @@ export class ApplyPatchResponsesBridge extends ApplyPatchErrorState {
     if (items.length !== originalLength) {
       if (isObj(response) && response !== root) response.output = items;
       else if (isObj(root)) root.output = items;
-      void outputPath;
       modified = true;
     }
     if (stream) {

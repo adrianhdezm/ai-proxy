@@ -49,7 +49,7 @@ export function applyPatchDescription(tool: unknown): string {
 
 /** Encodes a string the way Go's encoding/json does (HTML-sensitive characters and U+2028/2029 escaped). */
 export function goJSONString(value: string): string {
-  return JSON.stringify(value).replace(/[<>&  ]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
 }
 
 /** Encodes the complete patch text as function arguments. */

@@ -1,15 +1,13 @@
 // Ported from: internal/translator/codex/openai/responses/codex_openai-responses_response_test.go
-// Skipped cases: TestApplyPatchResponsesActualRequestGatesNativeCodex (partially: the native-gating halves are ported;
-//   the real ApplyPatchResponsesBridge / NormalizeApplyPatchResponsesRequest are not part of this slice, so the bridged
-//   half drives a stub bridge through the structural ResponsesBridge contract instead)
+// Skipped cases: none
 import { expect, test } from "bun:test";
 import { getAt, gstr } from "../../../../../src/util/gpath.ts";
 import { emptyContext, type TranslatorState } from "../../../../../src/translator/types.ts";
 import {
   convertCodexResponseToOpenAIResponses,
   convertCodexResponseToOpenAIResponsesNonStream,
-  type ResponsesBridge,
 } from "../../../../../src/translator/codex/openai/responses/index.ts";
+import { ApplyPatchResponsesBridge, normalizeApplyPatchResponsesRequest } from "../../../../../src/translator/common/apply_patch_responses.ts";
 
 function get(body: string, path: string): unknown {
   const text = body.startsWith("data:") ? body.slice(5).trim() : body;
@@ -110,48 +108,20 @@ test("ConvertCodexResponseToOpenAIResponses_MissingSourcesStayAbsentWithCitation
 
 test("ApplyPatchResponsesActualRequestGatesNativeCodex", () => {
   const original = `{"tools":[{"type":"custom","name":"apply_patch"}]}`;
-  // What NormalizeApplyPatchResponsesRequest makes of the original declaration.
-  const bridged = `{"tools":[{"type":"function","name":"apply_patch","parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}}]}`;
+  const [bridged, errNormalize] = normalizeApplyPatchResponsesRequest(original);
+  expect(errNormalize).toBeUndefined();
   const raw = `data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"a","call_id":"c","name":"apply_patch","arguments":"{\\"input\\":\\"p\\"}"}}`;
-
   // Native Codex: no bridge in the state, the event is untouched.
-  let out = stream("m", original, original, raw, {});
-  expect(out).toEqual([raw]);
+  expect(stream("m", original, original, raw, {})).toEqual([raw]);
   // Configuration supplying the bridged request alone must not enable bridging.
-  out = stream("m", original, bridged, raw, {});
-  expect(out).toEqual([raw]);
-
-  // An executor-owned bridge is consulted and its payloads are re-framed.
-  const seen: string[] = [];
-  const bridge: ResponsesBridge = {
-    transform(event: string): string[] {
-      seen.push(event);
-      return [
-        `{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","input":""}}`,
-        `{"type":"response.custom_tool_call_input.done","output_index":0,"input":"p"}`,
-        `{"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","input":"p"}}`,
-      ];
-    },
-    transformNonStream(response: string): string {
-      return response;
-    },
-  };
-  out = stream("m", original, bridged, raw, { value: bridge });
-  expect(seen).toEqual([raw.slice(6)]);
+  expect(stream("m", original, bridged, raw, {})).toEqual([raw]);
+  // An executor-owned bridge converts the same Codex wire format.
+  let out = stream("m", original, bridged, raw, { value: new ApplyPatchResponsesBridge(original) });
   expect(out.length).toBe(3);
-  expect(out.every((line) => line.startsWith("data: "))).toBe(true);
   expect(gstr(getAt(JSON.parse(out[2]!.slice(6)), "item.input"))).toBe("p");
-
-  // A failing bridge makes the non-stream translation unusable.
-  let failure: Error | undefined;
-  const failing: ResponsesBridge = {
-    transform: () => [],
-    transformNonStream(): string {
-      failure = new Error("invalid apply_patch arguments");
-      throw failure;
-    },
-    toolInputError: () => failure,
-  };
-  expect(nonStream("m", `{"type":"response.completed","response":{"id":"r","output":[]}}`, { value: failing })).toBe("");
-  expect(failure).toBeDefined();
+  const failed = new ApplyPatchResponsesBridge(original);
+  out = stream("m", original, bridged, `data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"apply_patch","arguments":"{}"}}`, { value: failed });
+  expect(out.length).toBe(1);
+  expect(gstr(getAt(JSON.parse(out[0]!.slice(6)), "type"))).toBe("response.failed");
+  expect(failed.toolInputError()).toBeDefined();
 });

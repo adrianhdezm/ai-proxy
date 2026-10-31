@@ -48,6 +48,9 @@ export function claudeCredentialAccountUUID(auth: Auth | undefined): string {
   return "";
 }
 
+/** Explicit session headers honoured for every caller, in priority order. */
+const claudeGenericSessionHeaders = ["Session-Id", "Session_id", "X-Session-ID", "X-Session-Affinity"];
+
 function sessionFromUserID(payload: string): string {
   const userID = getAt(tryParse(payload), "metadata.user_id");
   if (typeof userID !== "string") return "";
@@ -79,6 +82,11 @@ export function claudeAgentSessionUUIDForRequest(
       const t = v.trim();
       return isUUID(t) ? t.toLowerCase() : stableUUIDFromSeed("cli-proxy-api\x00claude\x00agent-conversation\x00" + t);
     }
+  }
+  // Generic protocol session headers (Go: cliproxysession.ExtractSessionInfo, reduced).
+  for (const name of claudeGenericSessionHeaders) {
+    const v = (headers?.get(name) ?? "").trim();
+    if (v !== "") return isUUID(v) ? v.toLowerCase() : stableUUIDFromSeed("cli-proxy-api\x00claude\x00agent-conversation\x00" + name.toLowerCase() + ":" + v);
   }
   let identity = "";
   for (const payload of [originalPayload, translatedPayload]) {

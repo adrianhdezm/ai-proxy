@@ -26,6 +26,10 @@ export interface ClaudeHeaderDefaults {
   anthropicBetaAppend?: string[];
   /** "" synthesises x-client-request-id, "passthrough" forwards only the caller's, "off" never sends it. */
   clientRequestId?: "" | "passthrough" | "off";
+  /** IANA zone for the cloaked currentDate reminder when the credential sets none ("" = process local). */
+  timezone?: string;
+  /** false opts out of the injected diagnostics field and its cache-diagnosis beta (default true). */
+  injectDiagnostics?: boolean;
 }
 
 export const defaultClaudeFingerprintUserAgent = "claude-cli/2.1.280 (external, cli)";

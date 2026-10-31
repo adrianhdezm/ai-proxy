@@ -22,7 +22,7 @@ import {
   type ResponsesToolDescriptor,
   type ResponsesToolIdentity,
 } from "../../../../util/responses_tools.ts";
-import { applyPatchDescription, applyPatchParameters, isApplyPatchCustomTool } from "./apply_patch.ts";
+import { applyPatchDescription, applyPatchParameters, isApplyPatchCustomTool } from "../../../common/apply_patch_tool.ts";
 
 const responsesToolSearchDefaultParameters = `{"type":"object","properties":{"query":{"type":"string","description":"Search query for deferred tools."},"limit":{"type":"number","description":"Maximum number of tools to return."}},"required":["query"],"additionalProperties":false}`;
 
@@ -190,7 +190,7 @@ export function buildGeminiFunctionDeclarations(root: unknown, withDeclarations 
     if (descStr !== "") funcDecl.description = descStr;
     if (isApplyPatchCustomTool(desc.tool)) {
       funcDecl.description = applyPatchDescription(desc.tool);
-      funcDecl.parametersJsonSchema = applyPatchParameters();
+      funcDecl.parametersJsonSchema = JSON.parse(applyPatchParameters()) as unknown;
     } else if (desc.toolType === "custom") {
       funcDecl.parametersJsonSchema = { type: "object", properties: { input: { type: "string" } }, required: ["input"] };
     } else if (desc.clientSearch) {

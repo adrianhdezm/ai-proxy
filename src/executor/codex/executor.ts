@@ -13,10 +13,20 @@
 // credentialScoped / transientRateLimit / requestScoped / streamTruncated flags
 // drive the AuthManager's cooldown and failover.
 //
+// Stream bootstrap buffering (options.streamBootstrapBuffering, Go:
+// codex.stream-bootstrap-buffering): executeStream reads the stream before
+// returning it and holds back the handshake frames (response.created, ...) until
+// the first generated event, so an overload / rate-limit rejection the backend
+// smuggles into an HTTP 200 stream throws before any chunk and the manager fails
+// over. See bootstrapStream below.
+//
+// Reasoning replay (reasoning_replay.ts): Claude inbound turns get the encrypted
+// reasoning of earlier turns of the same session re-inserted from the cache,
+// which is filled from response.completed and cleared on an invalid signature.
+//
 // Not ported (outside this slice): SIWC credentials and body rules, zstd request
 // compression, websockets transport, image endpoints and the image_generation
-// tool injection, /responses/compact, multi-agent v2 optimisation, the reasoning
-// replay cache, bootstrap buffering, prompt-cache keys (Session-Id), the payload
+// tool injection, /responses/compact, multi-agent v2 optimisation, prompt-cache keys (Session-Id), the payload
 // config finalizer, usage reporting and request logging, the Claude input-token
 // estimate on message_start, and the Home refresh/file-lock path.
 import type { Auth } from "../../auth/types.ts";
@@ -31,8 +41,10 @@ import { log } from "../../log.ts";
 import { type ExecOptions, type ExecRequest, type ExecResponse, type ProviderExecutor, type StreamResult, StatusError, responseFormatOrSource } from "../types.ts";
 import { codexAuthUsesAPIKey, codexBaseURL, codexCreds, isNativeCodexRequest } from "./creds.ts";
 import {
+  type TerminalFailure,
   codexTerminalFailureErrWithCooling,
   hasMeaningfulCodexOutputDelta,
+  isCodexOverloadBootstrapFailure,
   isCodexTerminalEmptyIncomplete,
   newCodexEmptyIncompleteStreamError,
   newCodexIncompleteStreamError,
@@ -55,7 +67,15 @@ import {
   setStringIfDifferent,
   translateCodexRequestPair,
 } from "./request.ts";
-import { CodexSSEScanner, scanCodexSSEText } from "./sse_scanner.ts";
+import { type CodexSSEItem, CodexSSEScanner, scanCodexSSEText, utf8Len } from "./sse_scanner.ts";
+import { codexBootstrapMaxBufferedBytes, codexBootstrapMaxBufferedFrames, isCodexBootstrapBufferableEvent, newCodexBootstrapOverloadErr } from "./bootstrap.ts";
+import {
+  type CodexReasoningReplayScope,
+  applyCodexReasoningReplayCache,
+  cacheCodexReasoningReplayFromCompleted,
+  clearCodexReasoningReplayOnInvalidSignature,
+} from "./reasoning_replay.ts";
+import { type CodexReasoningReplayCache, defaultCodexReasoningReplayCache } from "../../cache/codex_reasoning_replay_cache.ts";
 import { asRequestError, applyRequestThinking, resolvedModelInfo } from "./thinking.ts";
 import { countCodexInputTokens } from "./tokens.ts";
 import { normalizeCodexToolSchemas } from "./tool_schema.ts";
@@ -77,8 +97,24 @@ export interface CodexExecutorOptions {
   /** codex-header-defaults: User-Agent / beta features for OAuth credentials. */
   headerDefaults?: CodexHeaderDefaults;
   fetch?: FetchLike;
-  /** Clock (epoch ms) for resets_at / Retry-After dates and refresh timestamps. */
+  /**
+   * Clock (epoch ms) for resets_at / Retry-After dates, refresh timestamps and
+   * the stream bootstrap time ceiling.
+   */
   now?: () => number;
+  /**
+   * codex.stream-bootstrap-buffering (default false): hold back the frames that
+   * arrive before generation starts so an overload or rate-limit rejection inside
+   * an HTTP 200 stream fails over to the next credential.
+   */
+  streamBootstrapBuffering?: boolean;
+  /**
+   * codex.stream-bootstrap-timeout in ms (default 0 = no time ceiling, only the
+   * frame and byte budgets). Measured with `now` from the response headers.
+   */
+  streamBootstrapTimeoutMs?: number;
+  /** Reasoning replay store; defaults to the process-wide defaultCodexReasoningReplayCache. */
+  reasoningReplayCache?: CodexReasoningReplayCache;
 }
 
 interface PreparedRequest {
@@ -91,6 +127,8 @@ interface PreparedRequest {
   responseFormat: Format;
   /** Native Codex Responses Lite requests keep the completed output untouched. */
   preserveNativeOutput: boolean;
+  /** Reasoning replay scope (invalid unless a Claude inbound request with a session). */
+  replayScope: CodexReasoningReplayScope;
 }
 
 /** Stateless executor for the Codex Responses API (Go: CodexExecutor). */
@@ -99,11 +137,13 @@ export class CodexExecutor implements ProviderExecutor {
   private readonly options: CodexExecutorOptions;
   private readonly fetchFn: FetchLike;
   private readonly now: () => number;
+  private readonly replayCache: CodexReasoningReplayCache;
 
   constructor(options: CodexExecutorOptions = {}) {
     this.options = options;
     this.fetchFn = options.fetch ?? ((input, init) => fetch(input, init));
     this.now = options.now ?? Date.now;
+    this.replayCache = options.reasoningReplayCache ?? defaultCodexReasoningReplayCache;
   }
 
   private get modelLevelCooling(): boolean {
@@ -147,6 +187,8 @@ export class CodexExecutor implements ProviderExecutor {
     body = normalizeCodexInstructions(body, preserveNativeOutput);
     body = normalizeCodexParallelToolCalls(body, opts.headers);
     body = normalizeCodexToolSchemas(body);
+    const replay = applyCodexReasoningReplayCache(this.replayCache, from, req, opts, body);
+    body = replay.body;
     body = sanitizeCodexInputItemIDs(body);
 
     const url = baseURL.replace(/\/+$/, "") + "/responses";
@@ -154,7 +196,7 @@ export class CodexExecutor implements ProviderExecutor {
     applyCodexHeaders(headers, auth, apiKey, true, { disableCloaking: this.options.disableCloaking, headerDefaults: this.options.headerDefaults }, opts.headers);
     applyCodexRoutingHint(headers, auth, baseModel, body, opts.headers);
     applyModelHeaderOverrides(headers, baseModel);
-    return { url, headers, body, originalPayload, from, responseFormat, preserveNativeOutput };
+    return { url, headers, body, originalPayload, from, responseFormat, preserveNativeOutput, replayScope: replay.scope };
   }
 
   private async send(auth: Auth, prepared: PreparedRequest, opts: ExecOptions): Promise<Response> {
@@ -165,13 +207,14 @@ export class CodexExecutor implements ProviderExecutor {
   }
 
   /** Reads a rejected response and classifies it (Go: newCodexStatusErrWithHeadersAndCooling). */
-  private async statusError(resp: Response): Promise<StatusError> {
+  private async statusError(resp: Response, replayScope: CodexReasoningReplayScope): Promise<StatusError> {
     let body = "";
     try {
       body = await resp.text();
     } catch {
       // An unreadable error body is classified by its status alone.
     }
+    clearCodexReasoningReplayOnInvalidSignature(this.replayCache, replayScope, resp.status, body);
     log.debug("codex executor: request error", { status: resp.status });
     return newCodexStatusErrWithHeadersAndCooling(resp.status, resp.headers, body, this.modelLevelCooling, this.now());
   }
@@ -179,7 +222,7 @@ export class CodexExecutor implements ProviderExecutor {
   async execute(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
     const prepared = this.prepare(auth, req, opts, false);
     const resp = await this.send(auth, prepared, opts);
-    if (resp.status < 200 || resp.status >= 300) throw await this.statusError(resp);
+    if (resp.status < 200 || resp.status >= 300) throw await this.statusError(resp, prepared.replayScope);
 
     const { text, readError } = await readBodyText(resp);
     const items = newCollectedOutputItems();
@@ -192,7 +235,10 @@ export class CodexExecutor implements ProviderExecutor {
       if (hasMeaningfulCodexOutputDelta(root)) sawOutputDelta = true;
 
       const failure = codexTerminalFailureErrWithCooling(eventData, this.modelLevelCooling, this.now());
-      if (failure) throw failure.error;
+      if (failure) {
+        clearCodexReasoningReplayOnInvalidSignature(this.replayCache, prepared.replayScope, failure.error.statusCode, failure.body);
+        throw failure.error;
+      }
 
       if (eventType === "response.output_item.done") {
         collectCodexOutputItemDone(root, items);
@@ -202,6 +248,7 @@ export class CodexExecutor implements ProviderExecutor {
       if (isCodexTerminalEmptyIncomplete(root, collectedOutputItemCount(items), sawOutputDelta)) throw newCodexEmptyIncompleteStreamError();
 
       const completedData = patchedEventData(eventData, root, items, false);
+      if (eventType === "response.completed") cacheCodexReasoningReplayFromCompleted(this.replayCache, prepared.replayScope, completedData);
       const state: TranslatorState = {};
       const ctx: TranslateContext = { signal: opts.signal };
       const out = defaultRegistry.translateNonStream(ctx, FormatCodex, prepared.responseFormat, req.model, prepared.originalPayload, prepared.body, completedData, state);
@@ -216,101 +263,151 @@ export class CodexExecutor implements ProviderExecutor {
   async executeStream(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<StreamResult> {
     const prepared = this.prepare(auth, req, opts, true);
     const resp = await this.send(auth, prepared, opts);
-    if (resp.status < 200 || resp.status >= 300) throw await this.statusError(resp);
-    return { headers: resp.headers, chunks: this.streamChunks(resp, req, opts, prepared) };
+    if (resp.status < 200 || resp.status >= 300) throw await this.statusError(resp, prepared.replayScope);
+    // The bootstrap clock starts at the response headers (Go: responseReady).
+    const bootstrapStart = this.now();
+    const source = new CodexLineSource(resp.body, opts.signal);
+    const processor = new CodexStreamProcessor(this, req, opts, prepared);
+    if (this.options.streamBootstrapBuffering !== true) {
+      return { headers: resp.headers, chunks: this.streamChunks(source, processor, opts, { chunks: [], terminal: false }) };
+    }
+    let bootstrap: CodexBootstrap;
+    try {
+      bootstrap = await this.bootstrapStream(source, processor, opts, bootstrapStart);
+    } catch (err) {
+      source.close();
+      throw err;
+    }
+    return { headers: resp.headers, chunks: this.streamChunks(source, processor, opts, bootstrap) };
+  }
+
+  /**
+   * The buffered head of ExecuteStream (Go: the `if buffering` scan loop). Reads
+   * until the first frame that is not a bufferable handshake frame, holding the
+   * translated handshake chunks back. An overload rejection inside that window
+   * throws its 503/429 classification before any chunk exists, so the manager
+   * fails over; any other terminal failure is delivered in-stream after the held
+   * chunks. The hold ends when a frame would push it past
+   * codexBootstrapMaxBufferedFrames upstream lines or codexBootstrapMaxBufferedBytes
+   * (upstream bytes plus translated chunk bytes), or once streamBootstrapTimeoutMs
+   * has passed since the response headers; the stream is then released as is.
+   */
+  private async bootstrapStream(source: CodexLineSource, processor: CodexStreamProcessor, opts: ExecOptions, start: number): Promise<CodexBootstrap> {
+    const timeout = Math.max(0, this.options.streamBootstrapTimeoutMs ?? 0);
+    const timeoutReached = () => timeout > 0 && this.now() - start >= timeout;
+    const scanner = source.scanner;
+    let bufferedFrames = 0;
+    let bufferedBytes = 0;
+    let exhaustedReason = "";
+    const buffered: string[] = [];
+    // Consulted while a split event is being assembled, so one event cannot hold more than the budgets.
+    scanner.setBudgetChecker((_line, heldLines, heldBytes) => {
+      if (timeoutReached()) exhaustedReason = "time budget";
+      else if (bufferedFrames + heldLines >= codexBootstrapMaxBufferedFrames) exhaustedReason = "frame budget";
+      else if (bufferedBytes + heldBytes >= codexBootstrapMaxBufferedBytes) exhaustedReason = "byte budget";
+      else return false;
+      return true;
+    });
+    try {
+      for (;;) {
+        if (opts.signal?.aborted) throw abortReason(opts.signal);
+        const item = await source.next();
+        if (!item) break;
+        if (item.budget) {
+          log.debug("codex executor: bootstrap budget exhausted, releasing stream", { reason: exhaustedReason, lines: bufferedFrames, bytes: bufferedBytes });
+          return { chunks: buffered, terminal: false };
+        }
+        const out = processor.processLine(item.line);
+        if (out.failure) {
+          if (out.failure.overload && !timeoutReached()) {
+            log.debug("codex executor: bootstrap overload rejection, failing over", { lines: bufferedFrames });
+            throw newCodexBootstrapOverloadErr(out.failure.body);
+          }
+          return { chunks: buffered, terminal: false, error: out.failure.error };
+        }
+        if (out.handshake && !out.terminal) {
+          const rawLines = item.rawLines > 0 ? item.rawLines : 1;
+          let frameBytes = item.rawBytes;
+          for (const chunk of out.chunks) frameBytes += utf8Len(chunk);
+          const reached = timeoutReached();
+          const totalFrames = bufferedFrames + scanner.heldLines() + rawLines;
+          const totalBytes = bufferedBytes + scanner.heldBytes() + frameBytes;
+          if (!reached && totalFrames <= codexBootstrapMaxBufferedFrames && totalBytes <= codexBootstrapMaxBufferedBytes) {
+            bufferedFrames += rawLines;
+            bufferedBytes += frameBytes;
+            buffered.push(...out.chunks);
+            continue;
+          }
+          const reason = reached ? "time budget" : totalFrames > codexBootstrapMaxBufferedFrames ? "frame budget" : "byte budget";
+          log.debug("codex executor: bootstrap budget exhausted, releasing stream", { reason, lines: bufferedFrames, bytes: bufferedBytes });
+        }
+        return { chunks: [...buffered, ...out.chunks], terminal: out.terminal };
+      }
+    } finally {
+      scanner.setBudgetChecker(undefined);
+    }
+    // The stream ended (or failed) before generation started.
+    if (source.readError !== undefined) {
+      if (opts.signal?.aborted) throw abortReason(opts.signal);
+      throw source.readError;
+    }
+    if (opts.signal?.aborted) throw abortReason(opts.signal);
+    if (buffered.length === 0) throw new StatusError(502, codexEmptyStreamMessage);
+    throw newCodexIncompleteStreamError();
   }
 
   /**
    * Translates the upstream SSE body line by line (Go: the ExecuteStream reader
-   * goroutine without bootstrap buffering). A terminal failure event throws its
-   * classified StatusError after everything already emitted; a body that ends
-   * without a terminal event throws the 502 empty-stream error when nothing was
-   * emitted (the manager fails over) and otherwise the truncated-stream error.
+   * goroutine), after replaying what a buffered bootstrap held. A terminal
+   * failure event throws its classified StatusError after everything already
+   * emitted; a body that ends without a terminal event throws the 502
+   * empty-stream error when nothing was emitted (the manager fails over) and
+   * otherwise the truncated-stream error.
    */
-  private async *streamChunks(resp: Response, req: ExecRequest, opts: ExecOptions, prepared: PreparedRequest): AsyncGenerator<string> {
-    const state: TranslatorState = {};
-    const ctx: TranslateContext = { signal: opts.signal };
-    const items = newCollectedOutputItems();
-    let sawOutputDelta = false;
+  private async *streamChunks(source: CodexLineSource, processor: CodexStreamProcessor, opts: ExecOptions, bootstrap: CodexBootstrap): AsyncGenerator<string> {
     let emitted = 0;
-
-    // Returns the translated frames of one scanned line and whether it was a terminal success event.
-    const handleLine = (line: string): { chunks: string[]; terminal: boolean } => {
-      let translatedLine = line;
-      let terminal = false;
-      if (line.startsWith("data:")) {
-        const data = line.slice(5).trim();
-        const root = tryParse<unknown>(data);
-        translatedLine = "data: " + data;
-        const eventType = codexEventType(root, data);
-        const failure = codexTerminalFailureErrWithCooling(data, this.modelLevelCooling, this.now());
-        if (failure) throw failure.error;
-        if (hasMeaningfulCodexOutputDelta(root)) sawOutputDelta = true;
-        if (isCodexTerminalEmptyIncomplete(root, collectedOutputItemCount(items), sawOutputDelta)) throw newCodexEmptyIncompleteStreamError();
-        switch (eventType) {
-          case "response.output_item.done":
-            collectCodexOutputItemDone(root, items);
-            break;
-          case "response.completed":
-          case "response.incomplete":
-          case "response.done":
-            terminal = true;
-            translatedLine = "data: " + (prepared.preserveNativeOutput ? normalizedCompletion(data, root) : patchedEventData(data, root, items, true));
-            break;
-        }
-      }
-      const chunks = defaultRegistry.translateStream(ctx, FormatCodex, prepared.responseFormat, req.model, prepared.originalPayload, prepared.body, translatedLine, state);
-      return { chunks, terminal };
-    };
-
-    const body = resp.body;
-    if (!body) throw new StatusError(502, codexEmptyStreamMessage);
-    const reader = body.getReader();
-    const scanner = new CodexSSEScanner({ onDiagnostic: logSSEDiagnostic });
-    const onAbort = () => {
-      reader.cancel().catch(() => {});
-    };
-    opts.signal?.addEventListener("abort", onAbort, { once: true });
-    let drained = false;
     try {
-      let readError: unknown;
+      for (const chunk of bootstrap.chunks) {
+        if (chunk.length === 0) continue;
+        emitted++;
+        yield chunk;
+      }
+      if (bootstrap.error !== undefined) throw bootstrap.error;
+      if (bootstrap.terminal) return;
       for (;;) {
-        let result: Awaited<ReturnType<typeof reader.read>>;
-        try {
-          result = await reader.read();
-        } catch (err) {
-          readError = err;
-          break;
+        const item = await source.next();
+        if (!item) break;
+        if (item.budget) continue;
+        const out = processor.processLine(item.line);
+        if (out.failure) throw out.failure.error;
+        for (const chunk of out.chunks) {
+          if (chunk.length === 0) continue;
+          emitted++;
+          yield chunk;
         }
-        const lines = result.done ? scanner.flush() : scanner.push(result.value);
-        for (const line of lines) {
-          const out = handleLine(line);
-          for (const chunk of out.chunks) {
-            if (chunk.length === 0) continue;
-            emitted++;
-            yield chunk;
-          }
-          if (out.terminal) return;
-        }
-        if (result.done) {
-          drained = true;
-          break;
-        }
+        if (out.terminal) return;
       }
       if (opts.signal?.aborted) return;
-      if (readError !== undefined) log.debug("codex executor: upstream stream read error", { error: readError instanceof Error ? readError.message : String(readError) });
+      if (source.readError !== undefined) {
+        const error = source.readError;
+        log.debug("codex executor: upstream stream read error", { error: error instanceof Error ? error.message : String(error) });
+      }
       if (emitted === 0) throw new StatusError(502, codexEmptyStreamMessage);
       throw newCodexIncompleteStreamError();
     } finally {
-      opts.signal?.removeEventListener("abort", onAbort);
-      // Stop the upstream body unless it was read to the end (terminal event, error, early consumer stop).
-      if (!drained) reader.cancel().catch(() => {});
-      try {
-        reader.releaseLock();
-      } catch {
-        // already released
-      }
+      // Stops the upstream body unless it was read to the end (terminal event, error, early consumer stop).
+      source.close();
     }
+  }
+
+  /** @internal Used by CodexStreamProcessor. */
+  terminalFailure(data: string): TerminalFailure | undefined {
+    return codexTerminalFailureErrWithCooling(data, this.modelLevelCooling, this.now());
+  }
+
+  /** @internal Used by CodexStreamProcessor. */
+  get reasoningReplayCache(): CodexReasoningReplayCache {
+    return this.replayCache;
   }
 
   /**
@@ -354,6 +451,183 @@ export class CodexExecutor implements ProviderExecutor {
 /** Builds the "codex" provider executor. */
 export function createCodexExecutor(options: CodexExecutorOptions = {}): CodexExecutor {
   return new CodexExecutor(options);
+}
+
+/** What a bootstrap hands to the stream: chunks to replay first, then an in-stream error or the end. */
+interface CodexBootstrap {
+  chunks: string[];
+  /** The first released frame was a terminal success event: nothing more to read. */
+  terminal: boolean;
+  /** A non-overload terminal failure seen while buffering, delivered after the chunks. */
+  error?: StatusError;
+}
+
+interface CodexLineOutcome {
+  chunks: string[];
+  /** response.completed / incomplete / done: the stream is finished. */
+  terminal: boolean;
+  /** The frame may be held back during a bootstrap (Go: isHandshake). */
+  handshake: boolean;
+  /** A terminal failure; `overload` marks the ones a bootstrap fails over on. */
+  failure?: { error: StatusError; body: string; overload: boolean };
+}
+
+/** Per-stream translation state shared by the bootstrap and the streaming phase. */
+class CodexStreamProcessor {
+  private readonly state: TranslatorState = {};
+  private readonly ctx: TranslateContext;
+  private readonly items = newCollectedOutputItems();
+  private sawOutputDelta = false;
+
+  constructor(
+    private readonly executor: CodexExecutor,
+    private readonly req: ExecRequest,
+    opts: ExecOptions,
+    private readonly prepared: PreparedRequest,
+  ) {
+    this.ctx = { signal: opts.signal };
+  }
+
+  /** Classifies and translates one delivered line (Go: one iteration of the scan loop). */
+  processLine(line: string): CodexLineOutcome {
+    let translatedLine = line;
+    let terminal = false;
+    let handshake = false;
+    if (line.startsWith("data:")) {
+      const data = line.slice(5).trim();
+      const root = tryParse<unknown>(data);
+      translatedLine = "data: " + data;
+      const eventType = codexEventType(root, data);
+      const failure = this.executor.terminalFailure(data);
+      if (failure) {
+        clearCodexReasoningReplayOnInvalidSignature(this.executor.reasoningReplayCache, this.prepared.replayScope, failure.error.statusCode, failure.body);
+        return { chunks: [], terminal: false, handshake: false, failure: { error: failure.error, body: failure.body, overload: isCodexOverloadBootstrapFailure(failure.body) } };
+      }
+      if (hasMeaningfulCodexOutputDelta(root)) this.sawOutputDelta = true;
+      if (isCodexTerminalEmptyIncomplete(root, collectedOutputItemCount(this.items), this.sawOutputDelta)) {
+        // Not an overload rejection: in-stream delivery even while buffering.
+        return { chunks: [], terminal: false, handshake: false, failure: { error: newCodexEmptyIncompleteStreamError(), body: "", overload: false } };
+      }
+      handshake = isCodexBootstrapBufferableEvent(eventType, data);
+      switch (eventType) {
+        case "response.output_item.done":
+          collectCodexOutputItemDone(root, this.items);
+          break;
+        case "response.completed":
+        case "response.incomplete":
+        case "response.done": {
+          terminal = true;
+          const completed = this.prepared.preserveNativeOutput ? normalizedCompletion(data, root) : patchedEventData(data, root, this.items, true);
+          if (eventType !== "response.incomplete") cacheCodexReasoningReplayFromCompleted(this.executor.reasoningReplayCache, this.prepared.replayScope, completed);
+          translatedLine = "data: " + completed;
+          break;
+        }
+      }
+    } else {
+      // Comments, event:, id:, retry: and blank lines carry no event; they are held with their frame.
+      handshake = true;
+    }
+    const chunks = defaultRegistry.translateStream(this.ctx, FormatCodex, this.prepared.responseFormat, this.req.model, this.prepared.originalPayload, this.prepared.body, translatedLine, this.state);
+    return { chunks, terminal, handshake };
+  }
+}
+
+/**
+ * Pulls scanner items from the upstream body one physical line at a time, so
+ * the bootstrap budget checker sees the caller's state for every earlier line
+ * (Go: CodexSSEScanner.Scan over the response body).
+ */
+class CodexLineSource {
+  readonly scanner = new CodexSSEScanner({ onDiagnostic: logSSEDiagnostic });
+  /** A transport error that ended the body (Go: scanner.Err()). */
+  readError: unknown;
+  private reader?: ReadableStreamDefaultReader<Uint8Array>;
+  private lines: string[] = [];
+  private lineIndex = 0;
+  private items: CodexSSEItem[] = [];
+  private itemIndex = 0;
+  private finishPending = false;
+  private ended = false;
+  private drained = false;
+  private closed = false;
+  private readonly onAbort = () => {
+    this.reader?.cancel().catch(() => {});
+  };
+
+  constructor(
+    private readonly body: ReadableStream<Uint8Array> | null,
+    private readonly signal?: AbortSignal,
+  ) {}
+
+  async next(): Promise<CodexSSEItem | undefined> {
+    for (;;) {
+      if (this.itemIndex < this.items.length) return this.items[this.itemIndex++];
+      if (this.lineIndex < this.lines.length) {
+        this.items = this.scanner.scanLineItems(this.lines[this.lineIndex++]!);
+        this.itemIndex = 0;
+        continue;
+      }
+      if (this.finishPending) {
+        this.finishPending = false;
+        this.ended = true;
+        this.items = this.scanner.finishItems();
+        this.itemIndex = 0;
+        continue;
+      }
+      if (this.ended || this.closed) return undefined;
+      await this.fill();
+    }
+  }
+
+  private async fill(): Promise<void> {
+    if (!this.body) {
+      this.ended = true;
+      this.drained = true;
+      return;
+    }
+    if (!this.reader) {
+      this.reader = this.body.getReader();
+      this.signal?.addEventListener("abort", this.onAbort, { once: true });
+      if (this.signal?.aborted) this.onAbort();
+    }
+    let result: Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>;
+    try {
+      result = await this.reader.read();
+    } catch (err) {
+      this.readError = err;
+      this.ended = true;
+      return;
+    }
+    if (result.done) {
+      this.drained = true;
+      this.lines = this.scanner.endLines();
+      this.finishPending = true;
+    } else {
+      this.lines = this.scanner.splitLines(result.value);
+    }
+    this.lineIndex = 0;
+  }
+
+  /** Releases the body: cancelled unless it was read to the end. Idempotent. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.signal?.removeEventListener("abort", this.onAbort);
+    if (!this.reader) {
+      if (this.body && !this.body.locked) this.body.cancel().catch(() => {});
+      return;
+    }
+    if (!this.drained) this.reader.cancel().catch(() => {});
+    try {
+      this.reader.releaseLock();
+    } catch {
+      // already released
+    }
+  }
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
 }
 
 /** Reads a body to the end, keeping what arrived before a transport error (Go: io.ReadAll's partial data). */

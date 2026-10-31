@@ -11,10 +11,12 @@
 //   - validateClaudeCallerSystemBlocks / validateClaudeMidSystemMessageModel
 //   - rebuildMidSystemMessagesToTopLevel (opt-in)
 //
-// Not ported (see the executor report): the x-anthropic-billing-header block and
-// CCH signing, the currentDate reminder, relocation of caller system prompts into
-// mid-conversation role=system turns / <system-reminder> blocks, fallbacks
-// injection, sensitive-word obfuscation, context_management and diagnostics.
+//   - the x-anthropic-billing-header block, continuity tags and the session-pinned
+//     currentDate reminder (billing.ts); CCH signing itself is in signing.ts
+//
+// Not ported: relocation of caller system prompts into mid-conversation
+// role=system turns / <system-reminder> blocks, fallbacks / Fable reporting
+// injection and sensitive-word obfuscation.
 import type { Auth } from "../../auth/types.ts";
 import { AttributeAuthKind } from "../../auth/types.ts";
 import { isClaudeCodeAttributionSystemText, stripClaudeCodeAttributionSystem } from "../../util/claude_attribution.ts";
@@ -23,7 +25,24 @@ import { tryParse } from "../../util/json.ts";
 import { type ClaudeCodeRequestDetection, generateFakeUserIDWithSessionID, isValidUserID } from "./client_detection.ts";
 import { newClaudeCallerSystemBlockError, newClaudeMidSystemMessageModelError } from "./errors.ts";
 import { claudeModelUsesProgressDisplay } from "./model.ts";
-import { claudePayloadHasMidSystemMessage, claudeUsesLegacySystemReminder } from "./request_shape.ts";
+import {
+  claudePayloadHasMidSystemMessage,
+  claudeSubagentRequests1h,
+  claudeUsesLegacySystemReminder,
+  isClaudeProbeOrHelperRequest,
+  isClaudeSubagentRequest,
+} from "./request_shape.ts";
+import {
+  type ClaudeRequestContext,
+  claudeBillingFingerprintMessageText,
+  claudeCodeCurrentDate,
+  generateBillingHeader,
+  injectClaudeCodeCurrentDate,
+  resolveClaudeContinuityTags,
+  stripFirstUserClaudeCodeCurrentDateReminder,
+} from "./billing.ts";
+import { stripClaudeCacheControlTTL } from "./cache_control.ts";
+import { extractClaudeBillingTags } from "./diagnostics.ts";
 import { isClaudeOAuthToken } from "./upstream.ts";
 
 export const claudeCodeCLIIdentity = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -299,6 +318,12 @@ export interface ApplyCloakingOptions {
   explicitCacheMode?: boolean;
   /** Session UUID written to a synthesized metadata.user_id for non-CLI-profile credentials. */
   sessionID?: string;
+  /** Whether the billing header carries the cch=00000 placeholder and the continuity tags. */
+  cchSigning?: boolean;
+  /** cc_version of the billing header (default 2.1.280). */
+  billingVersion?: string;
+  /** Request context for continuity, the session date pin and the workload tag. */
+  rc?: ClaudeRequestContext;
 }
 
 export interface CloakResult {
@@ -307,9 +332,16 @@ export interface CloakResult {
 }
 
 /**
- * Applies the wire policy to a Messages body (Go: applyCloakingInternal,
- * simplified). Returns the body and whether cloaking ran. Throws a request-scoped
+ * Applies the wire policy to a Messages body (Go: applyCloakingInternal).
+ * Returns the body and whether cloaking ran. Throws a request-scoped
  * StatusError for caller system blocks Claude cannot carry.
+ *
+ * The cloaked body carries the billing header block (system[0]), the Claude
+ * Code identity block (system[1]), the caller system blocks after them, and the
+ * session-pinned currentDate reminder in the first user message. Continuity
+ * (cc_prev_req / cc_prompt_id, diagnostics state) is written to opts.rc.continuity.
+ * Deviation: caller system blocks stay top-level instead of being relocated into
+ * mid-conversation system turns, and fallbacks / Fable reporting blocks are not injected.
  */
 export function applyCloaking(cfg: ClaudeCloakConfig | undefined, auth: Auth | undefined, payload: string, apiKey: string, confirmedClaudeCode: boolean, opts: ApplyCloakingOptions = {}): CloakResult {
   const [policy, settings] = resolveClaudeWirePolicy(cfg, auth, apiKey, confirmedClaudeCode);
@@ -317,14 +349,52 @@ export function applyCloaking(cfg: ClaudeCloakConfig | undefined, auth: Auth | u
     if (policy.uncloak) payload = uncloakClaudeCodePayload(payload, confirmedClaudeCode);
     return { payload, cloaked: false };
   }
-  const root = tryParse<Record<string, unknown>>(payload);
+  let root = tryParse<Record<string, unknown>>(payload);
   if (!isObj(root)) return { payload, cloaked: false };
   if (!settings.strictMode) validateClaudeCallerSystemBlocks(root.system);
 
+  const rc = opts.rc;
   const isExplicit = opts.explicitCacheMode === true;
+  const isProbeOrHelper = isClaudeProbeOrHelperRequest(root);
+  let isSubagent = false;
+  let prevReq = "";
+  let promptID = "";
+  let pinnedDate = "";
+  if (!isProbeOrHelper) {
+    isSubagent = isClaudeSubagentRequest(rc?.incomingHeaders, root);
+    const existing = extractClaudeBillingTags(root);
+    if (rc) {
+      const resolved = resolveClaudeContinuityTags(rc, auth, payload, confirmedClaudeCode, existing.prevReq, existing.promptID);
+      if (resolved) {
+        prevReq = resolved.prevReq;
+        promptID = resolved.promptID;
+        pinnedDate = resolved.continuity.pinnedDate;
+        Object.assign(rc.continuity, resolved.continuity);
+      }
+    }
+  }
+  // Without continuity (probe/helper traffic or no session) the date is per request.
+  if (pinnedDate === "") pinnedDate = claudeCodeCurrentDate(rc ?? { now: () => Date.now(), timezone: "" }, auth);
+  if (!isProbeOrHelper && rc && rc.sessionDatePinRetentionMs > 0) {
+    payload = stripFirstUserClaudeCodeCurrentDateReminder(payload);
+    root = tryParse<Record<string, unknown>>(payload) as Record<string, unknown>;
+  }
+  const turnOrigin = !isProbeOrHelper && !isSubagent ? "human" : "";
+  const billing = generateBillingHeader(
+    opts.cchSigning === true,
+    opts.billingVersion ?? "2.1.280",
+    claudeBillingFingerprintMessageText(root),
+    "cli",
+    rc?.workload ?? "",
+    isSubagent,
+    prevReq,
+    promptID,
+    turnOrigin,
+  );
+
   const identityBlock: Record<string, unknown> = { type: "text", text: claudeCodeCLIIdentity };
   if (!isExplicit) identityBlock.cache_control = { type: "ephemeral" };
-  const systemBlocks: unknown[] = [identityBlock];
+  const systemBlocks: unknown[] = [{ type: "text", text: billing }, identityBlock];
   if (!settings.strictMode) {
     for (const block of collectForwardedClaudeSystemPromptBlocks(root.system)) {
       const forwarded: Record<string, unknown> = { type: "text", text: block.text };
@@ -337,8 +407,10 @@ export function applyCloaking(cfg: ClaudeCloakConfig | undefined, auth: Auth | u
     }
   }
   root.system = systemBlocks;
-  let out = JSON.stringify(root);
-  out = applyClaudeCloakThinkingDisplay(out, false);
+  let out = injectClaudeCodeCurrentDate(JSON.stringify(root), pinnedDate, isExplicit);
+  if (!isProbeOrHelper) out = applyClaudeCloakThinkingDisplay(out, false);
+  // Probes never use the 1h pool; subagents keep it only when they asked for it.
+  if (!isExplicit && (isProbeOrHelper || (isSubagent && !claudeSubagentRequests1h(rc?.incomingHeaders, out)))) out = stripClaudeCacheControlTTL(out);
 
   // The CLI identity (real OAuth or claude-code-cli profile) is applied later via
   // applyClaudeCLIIdentity; other cloaked credentials get the legacy fake user_id.

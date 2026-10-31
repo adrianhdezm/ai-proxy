@@ -11,3 +11,5 @@ export * from "./sse_scanner.ts";
 export * from "./thinking.ts";
 export * from "./tokens.ts";
 export * from "./tool_schema.ts";
+export * from "./bootstrap.ts";
+export * from "./reasoning_replay.ts";
