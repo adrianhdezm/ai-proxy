@@ -1,12 +1,12 @@
 # ai-proxy
 
-A Claude Messages-compatible proxy, written in TypeScript for Bun, that serves three upstreams through one endpoint:
+A Claude Messages- and OpenAI Responses-compatible proxy, written in TypeScript for Bun, that serves three upstreams:
 
 - **OpenAI**, through Codex OAuth (a ChatGPT subscription) or an OpenAI API key.
 - **Anthropic Claude**, through Claude Code OAuth or an Anthropic API key.
 - **Google Gemini**, through Gemini CLI OAuth or an AI Studio API key.
 
-Claude Code and similar clients point at the proxy and can then use any model from any of these backends. Requests are translated to each upstream's API and the answers are translated back, including streaming, tool calls and thinking.
+Claude Code and similar clients point at the proxy and can then use any model from any of these backends. Codex CLI and other OpenAI Responses clients can do the same through `/v1/responses`. Requests are translated to each upstream's API and the answers are translated back, including streaming, tool calls and thinking.
 
 It is a reduced port of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). OAuth tokens are stored in HashiCorp Vault (KV v2) or, for development, in local JSON files.
 
@@ -42,10 +42,14 @@ The API key is one of the values under `access.api-keys` in `config.yaml`. With 
 |---|---|
 | `POST /v1/messages` | Claude Messages, streaming (Anthropic SSE) or not |
 | `POST /v1/messages/count_tokens` | Token counting |
-| `GET /v1/models`, `GET /v1/models/:id` | Models served by the loaded credentials |
+| `POST /v1/responses` | OpenAI Responses, streaming or not; also a websocket on `GET /v1/responses` |
+| `POST /v1/responses/compact` | Responses compaction (Codex credentials) |
+| `POST /v1/images/generations`, `POST /v1/images/edits` | OpenAI image endpoints (Codex and OpenAI credentials) |
+| `GET /v1/models`, `GET /v1/models/:id` | Models served by the loaded credentials; OpenAI list shape for OpenAI and Codex clients |
+| `GET /v0/usage` | Usage statistics, when enabled |
 | `GET /health` | Health check |
 
-Inbound keys are accepted as `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or `?key=`.
+Claude endpoints answer errors in the Anthropic error format and OpenAI endpoints in the OpenAI one. Inbound keys are accepted as `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or `?key=`.
 
 A model name may carry a thinking suffix such as `gpt-5.4(high)` or `gemini-2.5-pro(8192)`. The suffix overrides the thinking settings in the request body.
 
@@ -101,6 +105,20 @@ A stream fails over only until its first byte reaches the client. After that, an
 
 OAuth tokens refresh in the background before they expire.
 
+## Optional behaviour
+
+These follow upstream and are off by default; see `config.example.yaml`.
+
+| Setting | Effect |
+|---|---|
+| `upstream.codex.stream-bootstrap-buffering` | Holds a Codex stream back until its first real output, so an overload or rate limit sent inside an HTTP 200 stream still fails over. Delays the response headers. |
+| `upstream.claude.tool-search` | Maps Responses-client `tool_search` to Anthropic native tool search. |
+| `client.codex.web-search-result-cache` | Keeps web search results for Responses clients that replay searches without them. |
+| `observability.usage.usage-statistics-enabled` | Records per-request usage, readable at `GET /v0/usage`. |
+| `multimedia.disable-image-generation` | Turns the image endpoints off and keeps the `image_generation` tool out of Codex requests. |
+
+Always on, as upstream: Codex reasoning replay, Claude thinking replay (API keys on compat models), and the Claude Code request disguise on OAuth credentials for non-Claude-Code callers (signed billing header, diagnostics, context management). `upstream.claude.disable-claude-cloak-mode` turns the disguise off.
+
 ## Development
 
 ```bash
@@ -124,7 +142,6 @@ bun run scripts/reconcile-tests.ts <path-to-CLIProxyAPI> <path-to-CLIProxyAPI-v7
 The following are not included:
 
 - **Other providers:** Kimi, xAI/Grok, Meta, Devin, Antigravity, Vertex.
-- **Other inbound APIs:** the OpenAI- and Gemini-compatible inbound endpoints.
+- **Other inbound APIs:** OpenAI chat completions and the Gemini-compatible inbound endpoints.
 - **Server extras:** the Management API, plugins and the Go SDK.
-- **Transports:** websocket transports.
 - **Packaging:** Docker and cluster packaging.
