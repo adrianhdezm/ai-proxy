@@ -138,13 +138,35 @@ function claudeResponsesTerminalState(stopReason: string): { eventType: string; 
   return { eventType: "response.completed", status: "completed", incompleteDetails: undefined };
 }
 
-function pickRequestJSON(originalRequestRawJSON: string, requestRawJSON: string): unknown {
+interface PickedRequest {
+  raw: string;
+  parsed: unknown;
+}
+
+function pickRequestJSON(originalRequestRawJSON: string, requestRawJSON: string): PickedRequest {
   for (const raw of [originalRequestRawJSON, requestRawJSON]) {
     if (!raw) continue;
     const parsed = tryParse<unknown>(raw);
-    if (parsed !== undefined || raw.trim() === "null") return parsed;
+    if (parsed !== undefined || raw.trim() === "null") return { raw, parsed };
   }
-  return undefined;
+  return { raw: "", parsed: undefined };
+}
+
+/**
+ * The request model name with gjson's first-occurrence semantics for duplicate
+ * keys (common.requestModelName parses with JSON.parse, which keeps the last).
+ */
+function requestModelNameFirst(originalRequestRawJSON: string, requestRawJSON: string): string {
+  for (const raw of [originalRequestRawJSON, requestRawJSON]) {
+    if (!raw || tryParse(raw) === undefined) continue;
+    for (const path of [["model"], ["request", "model"]]) {
+      const value = rawJSONAt(raw, path);
+      if (value === undefined) continue;
+      const model = tryParse<unknown>(value);
+      if (typeof model === "string" && model.trim() !== "") return model;
+    }
+  }
+  return requestModelName(originalRequestRawJSON, requestRawJSON);
 }
 
 const gfloat = (v: unknown): number => {
@@ -185,9 +207,16 @@ const echoFields: [string, (v: unknown) => unknown][] = [
 class ResponsesRequestEcho {
   private readonly values = new Map<string, unknown>();
 
-  constructor(root: unknown) {
+  constructor(request: PickedRequest) {
+    const root = request.parsed;
     if (!isObj(root)) return;
-    for (const [key, convert] of echoFields) if (key in root) this.values.set(key, convert(root[key]));
+    for (const [key, convert] of echoFields) {
+      if (!(key in root)) continue;
+      // gjson reads the first occurrence of a duplicated key; JSON.parse keeps the last.
+      const raw = rawJSONAt(request.raw, [key]);
+      const value = raw === undefined ? root[key] : tryParse<unknown>(raw);
+      this.values.set(key, convert(value === undefined && raw?.trim() !== "null" ? root[key] : value));
+    }
   }
 
   apply(dst: JSONObject): JSONObject {
@@ -251,10 +280,11 @@ export class ClaudeToResponsesState extends ApplyPatchErrorState {
   stopReason = "";
   usage = new UsageTokens();
 
-  constructor(requestJSON: unknown, toolSearch: boolean) {
+  constructor(request: PickedRequest, toolSearch: boolean) {
     super();
+    const requestJSON = request.parsed;
     this.toolSearch = toolSearch;
-    this.requestEcho = new ResponsesRequestEcho(requestJSON);
+    this.requestEcho = new ResponsesRequestEcho(request);
     this.toolWinners = responsesToolWinners(requestJSON, toolSearch);
     this.toolNames = buildClaudeToolNamesWithWinners(requestJSON, this.toolWinners, toolSearch);
   }
@@ -670,6 +700,104 @@ function populatedInput(input: unknown): boolean {
 
 const nowUnix = (): number => Math.floor(Date.now() / 1000);
 
+/**
+ * Returns the raw JSON text of the value at an object-key path, using the first
+ * occurrence of each key like gjson. JSON.parse would collapse duplicate keys,
+ * which the apply_patch snapshot validation must see.
+ */
+export function rawJSONAt(text: string, keys: string[]): string | undefined {
+  let i = 0;
+  const ws = (): void => {
+    while (i < text.length && " \t\r\n".includes(text[i]!)) i++;
+  };
+  const skipString = (): boolean => {
+    if (text[i] !== '"') return false;
+    i++;
+    while (i < text.length) {
+      const c = text[i]!;
+      if (c === "\\") i += 2;
+      else if (c === '"') {
+        i++;
+        return true;
+      } else i++;
+    }
+    return false;
+  };
+  const skipValue = (): boolean => {
+    ws();
+    const c = text[i];
+    if (c === '"') return skipString();
+    if (c === "{" || c === "[") {
+      const close = c === "{" ? "}" : "]";
+      i++;
+      ws();
+      if (text[i] === close) {
+        i++;
+        return true;
+      }
+      for (;;) {
+        ws();
+        if (c === "{") {
+          if (!skipString()) return false;
+          ws();
+          if (text[i] !== ":") return false;
+          i++;
+        }
+        if (!skipValue()) return false;
+        ws();
+        if (text[i] === ",") {
+          i++;
+          continue;
+        }
+        if (text[i] === close) {
+          i++;
+          return true;
+        }
+        return false;
+      }
+    }
+    const m = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/.exec(text.slice(i, i + 64));
+    if (!m) return false;
+    i += m[0].length;
+    return true;
+  };
+  for (const key of keys) {
+    ws();
+    if (text[i] !== "{") return undefined;
+    i++;
+    let found = false;
+    for (;;) {
+      ws();
+      if (text[i] === "}") return undefined;
+      const keyStart = i;
+      if (!skipString()) return undefined;
+      let name: unknown;
+      try {
+        name = JSON.parse(text.slice(keyStart, i));
+      } catch {
+        return undefined;
+      }
+      ws();
+      if (text[i] !== ":") return undefined;
+      i++;
+      ws();
+      if (name === key) {
+        found = true;
+        break;
+      }
+      if (!skipValue()) return undefined;
+      ws();
+      if (text[i] === ",") i++;
+    }
+    if (!found) return undefined;
+  }
+  ws();
+  const start = i;
+  if (!skipValue()) return undefined;
+  return text.slice(start, i);
+}
+
+
 /** Converts one Claude SSE line to zero or more Responses SSE frames. */
 export function convertClaudeResponseToOpenAIResponses(
   ctx: TranslateContext,
@@ -687,7 +815,8 @@ export function convertClaudeResponseToOpenAIResponses(
 
   // Expect `data: {..}` from Claude upstreams.
   if (!rawJSON.startsWith("data:")) return [];
-  const root = tryParse<unknown>(rawJSON.slice(5).trim());
+  const payload = rawJSON.slice(5).trim();
+  const root = tryParse<unknown>(payload);
   const ev = gstr(getAt(root, "type"));
   const out: string[] = [];
 
@@ -699,7 +828,7 @@ export function convertClaudeResponseToOpenAIResponses(
       st.createdAt = nowUnix();
       st.resetForMessage();
       st.usage.merge(getAt(msg, "usage"));
-      let requestModel = requestModelName(originalRequestRawJSON, requestRawJSON);
+      let requestModel = requestModelNameFirst(originalRequestRawJSON, requestRawJSON);
       if (requestModel === "") requestModel = modelName;
       const created: JSONObject = {
         type: "response.created",
@@ -790,7 +919,7 @@ export function convertClaudeResponseToOpenAIResponses(
         // Empty start input is a Claude placeholder, not an arguments fragment.
         const input = getAt(cb, "input");
         if (populatedInput(input)) {
-          const inputRaw = JSON.stringify(input);
+          const inputRaw = rawJSONAt(payload, ["content_block", "input"]) ?? JSON.stringify(input);
           const errValidate = validateApplyPatchSnapshots(st.funcInputSnapshot.get(idx) ?? "", inputRaw);
           if (errValidate && !st.funcInputSnapshotErrors.has(idx)) st.funcInputSnapshotErrors.set(idx, errValidate);
           // Compare late snapshots against this call's finished decoder without emitting more input.
@@ -1174,7 +1303,7 @@ export function convertClaudeResponseToOpenAIResponsesNonStream(
             if (callID !== "") item.callID = callID;
             const input = getAt(cb, "input");
             if (populatedInput(input)) {
-              const inputRaw = JSON.stringify(input);
+              const inputRaw = rawJSONAt(ch, ["content_block", "input"]) ?? JSON.stringify(input);
               const errValidate = validateApplyPatchSnapshots(item.inputSnapshot, inputRaw);
               if (errValidate && !st.funcInputSnapshotErrors.has(idx)) st.funcInputSnapshotErrors.set(idx, errValidate);
               item.inputSnapshot = inputRaw;
