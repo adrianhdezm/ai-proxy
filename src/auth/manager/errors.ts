@@ -551,8 +551,16 @@ export function resultErrorFromError(err: unknown): AuthError | undefined {
   return result;
 }
 
+/**
+ * A recorded failure caused by the request: the request_scoped code, the Codex
+ * "item not persisted" 404, or a request-fault body reported directly by a
+ * caller that does not know the internal code (Go: isRequestScopedResultError).
+ */
 export function isRequestScopedResultError(err: AuthError | undefined): boolean {
-  return !!err && err.code === ErrorCodeRequestScoped;
+  if (!err) return false;
+  if (err.code === ErrorCodeRequestScoped) return true;
+  if ((err.httpStatus ?? 0) === 404 && isItemNotPersisted(err.message)) return true;
+  return isRequestInvalidError(new AuthManagerError(err.code ?? "", err.message, { httpStatus: err.httpStatus }));
 }
 
 export function isTransientTransportResultError(err: AuthError | undefined): boolean {

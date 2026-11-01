@@ -34,7 +34,7 @@ import { normalizeModalities, resolveOAuthModelSetting, sanitizeOAuthModelAlias,
 import type { Config, ModelOverride, OAuthModelAlias, RoutingStrategy } from "./config/types.ts";
 import { applyClaudeToolSearchSetting, createExecutors } from "./executor/index.ts";
 import type { ProviderExecutor } from "./executor/types.ts";
-import { log, setLogLevel } from "./log.ts";
+import { log, logLevel, setLogLevel } from "./log.ts";
 import {
   applyExcludedModels,
   applyModelAliases,
@@ -111,6 +111,8 @@ export async function createApp(config: Config, options: AppOptions = {}): Promi
   } catch (err) {
     throw new Error(`validate credential weights: ${(err as Error).message}`);
   }
+  // The log level is process-wide; stop() puts back the level that was active before.
+  const previousLogLevel = logLevel();
   setLogLevel(config.debug ? "debug" : config.loggingLevel);
   const store = options.store ?? createTokenStore(config.auth, { fetch: options.fetch, now: options.now });
   const loginManager = newLoginManager(store);
@@ -173,6 +175,7 @@ export async function createApp(config: Config, options: AppOptions = {}): Promi
       await server.stop();
       manager.stopAutoRefresh();
       await manager.flushPersistence();
+      setLogLevel(previousLogLevel);
     },
     registerAuth(auth) {
       const current = manager.getById(auth.id) ? manager.update(auth) : manager.register(auth);

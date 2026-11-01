@@ -2,7 +2,7 @@
 // Ported from: sdk/api/handlers/openai/openai_responses_compact_test.go
 // Skipped cases: TestResponsesHandlerPreservesDirectResponseBeforeFirstFrame (plugin RequestTerminatedError direct
 //   responses are not ported); TestResponsesHandlerSendKeepAliveBeforeFT (pre-first-token keep-alives are not ported);
-//   TestOpenAIResponsesCompactDecodesZstdRequestBody (zstd request bodies are not ported);
+//   TestOpenAIResponsesCompactDecodesZstdRequestBody (ported in stream_bootstrap.test.ts);
 //   TestOpenAIResponsesCompactTransientFailureDoesNotCooldownAuthAndPreservesError and
 //   TestOpenAIResponsesCompactRequestFaultStopsFallbackAndPreservesError (the AuthManager's compact-specific
 //   cooldown neutrality lives in the manager, outside this slice). Adaptations: the request-log
