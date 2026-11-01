@@ -1,6 +1,6 @@
 // Ported from: internal/runtime/executor/claude_executor_thinking_signature_test.go
 // Skipped cases: TestClaudeThinkingSignaturesSurviveUpstreamPreparation drops its MCP alias stage (MCP alias
-// remapping is not ported) and adds a CCH-signing stage instead; TestClaudeThinkingSignaturesSurviveSensitiveWord
+// remapping was ported later in tool_alias.ts and is tested in mcp_alias.test.ts) and adds a CCH-signing stage instead; TestClaudeThinkingSignaturesSurviveSensitiveWord
 // Obfuscation (sensitive-word obfuscation not ported).
 import { expect, test } from "bun:test";
 import { newAuth } from "../../../src/auth/types.ts";

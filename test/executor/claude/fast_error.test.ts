@@ -51,7 +51,7 @@ describe("claude_executor_fast_error_test.go", () => {
           body = gzip(errorJSON);
           headers["Content-Encoding"] = "gzip";
         }
-        return new Response(body as BodyInit, { status: tc.status, headers });
+        return new Response(body as ConstructorParameters<typeof Response>[0], { status: tc.status, headers });
       });
       const auth = tc.oauth
         ? newAuth({ id: "fast-error-test", provider: "claude", attributes: { api_key: "sk-ant-oat-fast-error", cloak_mode: "always" }, metadata: claudeOAuthTestMetadata() })

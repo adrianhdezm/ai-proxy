@@ -4,7 +4,7 @@
 // ClaudeCode220CLIFingerprint is ported in full here; the CCH, diagnostics, context_management and date-pin cases
 // live in cch_diagnostics.test.ts. Dropped here: TestApplyClaudeToolPrefix*, TestStripClaudeToolPrefix* (tool prefix
 // not ported), TestRemapOAuthToolNames*, TestReverseRemap*, TestPrepareClaudeOAuthToolNames*, TestResolveClaudeMCPAlias*,
-// *MCPAlias* (MCP alias remapping not ported), TestCheckSystemInstructionsWithMode*, TestRelocateClaudeSystemPromptForCountTokens*, TestPrependClaudeSystemReminders*,
+// *MCPAlias* (MCP alias remapping is covered by mcp_alias.test.ts; these claude_executor_test.go alias cases are not re-ported), TestCheckSystemInstructionsWithMode*, TestRelocateClaudeSystemPromptForCountTokens*, TestPrependClaudeSystemReminders*,
 // TestInsertClaudeMidConversationSystemMessages* (system relocation not ported),
 // TestApplyCloaking_*Fallback*, TestApplyCloaking_Fable*, TestApplyCloaking_Sonnet*, TestClaudeExecutor_CloakedOpus55*,
 // TestClaudeOpus55Fallback*, TestApplyCloaking_*Fable* (fallbacks/reporting-outcomes injection not ported),
