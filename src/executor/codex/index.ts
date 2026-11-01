@@ -16,4 +16,5 @@ export * from "./bootstrap.ts";
 export * from "./reasoning_replay.ts";
 export * from "./reasoning_sanitize.ts";
 export * from "./prompt_cache.ts";
+export * from "./compression.ts";
 export * from "./websockets/index.ts";

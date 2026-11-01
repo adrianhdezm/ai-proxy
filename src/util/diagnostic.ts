@@ -85,6 +85,10 @@ export function safeErrorDiagnostic(err: unknown): string {
   const seen = new Set<unknown>();
   for (let current: unknown = err; current !== undefined && current !== null && !seen.has(current); current = current instanceof Error ? current.cause : undefined) {
     seen.add(current);
+    // Go: errors.Is(err, io.EOF / io.ErrUnexpectedEOF) along the wrap chain.
+    const text = (current instanceof Error ? current.message : String(current)).trim();
+    if (text === "unexpected EOF") add("unexpected_EOF");
+    else if (text === "EOF") add("EOF");
     if (current instanceof Error) {
       if (current.name === "TimeoutError") add("timeout");
       if (current.name === "AbortError") add("canceled");

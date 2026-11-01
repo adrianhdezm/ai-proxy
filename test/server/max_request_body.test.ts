@@ -35,7 +35,7 @@ function countingBody(text: string, chunkSize = 16): { stream: ReadableStream<Ui
   return { stream, read: () => offset };
 }
 
-function post(path: string, body: BodyInit, headers: Record<string, string>): Request {
+function post(path: string, body: string | Uint8Array | ReadableStream<Uint8Array>, headers: Record<string, string>): Request {
   return new Request(`http://proxy.test${path}`, { method: "POST", headers, body, duplex: "half" } as RequestInit);
 }
 

@@ -104,6 +104,7 @@ import {
   websocketInputLossError,
 } from "./context.ts";
 import { clearCodexReasoningReplayOnWebsocketError, encodeCodexWebsocketAsSSE, normalizeCodexWebsocketCompletion, parseCodexWebsocketErrorWithCooling } from "./errors.ts";
+import { effectiveProxyURL } from "../../proxy.ts";
 import { resolveResponsesSignatureTargetModel, sanitizeResponsesReasoningEncryptedContent } from "../reasoning_sanitize.ts";
 import { applyCodexPromptCacheHeaders, applyCodexWebsocketHeaders, buildCodexResponsesWebsocketURL, frameCodexWebsocketRequestBody, normalizeCodexWebsocketParallelToolCalls } from "./request.ts";
 import {
@@ -240,7 +241,7 @@ export class CodexWebsocketsExecutor implements ProviderExecutor, ExecutionSessi
 
   /** Go: executionProxyURL. */
   private proxyURL(auth: Auth, opts: ExecOptions): string {
-    return (opts.proxyUrl ?? auth.proxyUrl ?? "").trim();
+    return effectiveProxyURL(opts.proxyUrl, auth.proxyUrl, this.options.proxyUrl);
   }
 
   // -------------------------------------------------------------------------

@@ -17,7 +17,7 @@
 //   TestCodexExcludedModelsCredentialPriorityAfterPatchAndReload changes the credential's excluded_models
 //   metadata and re-registers through App.registerAuth instead of the management PATCH + auth-file synthesis
 //   (Management API and file watcher not carried); Gemini OAuth uses provider "gemini-cli".
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import {
   applyOAuthSettings,
   buildCodexConfigModels,
@@ -34,6 +34,11 @@ import type { ApiKeyCredential, Config, ModelOverride } from "../../src/config/t
 import { newAuth, StatusActive, type Auth } from "../../src/auth/types.ts";
 import { ModelRegistry, getCodexProModels, type ModelInfo } from "../../src/registry/index.ts";
 import type { PersistingTokenStore } from "../../src/store/index.ts";
+import { logLevel, setLogLevel } from "../../src/log.ts";
+
+// createApp sets the process-wide log level from the config; restore it for later test files.
+const initialLogLevel = logLevel();
+afterAll(() => setLogLevel(initialLogLevel));
 
 class MemoryStore implements PersistingTokenStore {
   readonly kind = "memory";

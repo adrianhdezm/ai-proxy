@@ -26,6 +26,8 @@
 // rules, thinking application on the main model, usage reporting and request
 // logging, and the per-credential config model lookup of directOpenAIImageModel.
 import type { Auth } from "../../auth/types.ts";
+import { type CodexFetch, type CodexRequestCompressionPolicy, codexAcceptEncoding, codexRequestWireBody, doCodexRequest } from "./compression.ts";
+import { applyFetchProxy } from "../proxy.ts";
 import { parseSuffix } from "../../thinking/index.ts";
 import { getAt, gstr, isArr, isObj } from "../../util/gpath.ts";
 import { tryParse, type JSONObject } from "../../util/json.ts";
@@ -86,6 +88,10 @@ export interface CodexImagesContext {
   now: () => number;
   modelLevelCooling: boolean;
   headerPolicy: CodexHeaderPolicy;
+  /** Global proxy used when neither the request nor the credential sets one. */
+  proxyUrl?: string;
+  /** Request compression for the Responses-tool path (direct image bodies are always plaintext). */
+  compression?: CodexRequestCompressionPolicy;
 }
 
 // ---------------------------------------------------------------------------
@@ -615,15 +621,15 @@ function codexImageBaseURL(auth: Auth): { apiKey: string; baseURL: string } {
   return { apiKey, baseURL: (baseURL.trim() === "" ? DefaultCodexBaseURL : baseURL.trim()).replace(/\/+$/, "") };
 }
 
-function proxyOf(auth: Auth, opts: ExecOptions): string {
-  return (opts.proxyUrl ?? auth.proxyUrl ?? "").trim();
-}
-
-async function postCodex(ctx: CodexImagesContext, auth: Auth, opts: ExecOptions, url: string, headers: Headers, body: string | Uint8Array): Promise<Response> {
-  const init: RequestInit & { proxy?: string } = { method: "POST", headers, body, signal: opts.signal };
-  const proxy = proxyOf(auth, opts);
-  if (proxy !== "") init.proxy = proxy;
-  return ctx.fetch(url, init);
+/**
+ * Sends an image request (Go: doCodexRequest): Responses-tool bodies may go out
+ * zstd-compressed (with the plaintext retry on 400/415); direct /images/* bodies
+ * are always plaintext (Go rewrote them after cacheHelper). The answer is decoded.
+ */
+async function postCodex(ctx: CodexImagesContext, auth: Auth, opts: ExecOptions, url: string, headers: Headers, body: string | Uint8Array, compressible: boolean): Promise<Response> {
+  const init = applyFetchProxy<{ headers: Headers; signal?: AbortSignal; proxy?: string }>({ headers, signal: opts.signal }, opts.proxyUrl, auth.proxyUrl, ctx.proxyUrl);
+  const wire = compressible ? codexRequestWireBody(ctx.compression, auth, url, body) : body;
+  return doCodexRequest(ctx.fetch as CodexFetch, url, init, body, wire);
 }
 
 async function codexStatusError(ctx: CodexImagesContext, resp: Response): Promise<StatusError> {
@@ -647,10 +653,11 @@ async function sendDirect(ctx: CodexImagesContext, auth: Auth, req: ExecRequest,
   const clientHeaders = opts.headers ? new Headers(opts.headers) : undefined;
   clientHeaders?.delete("User-Agent");
   const headers = new Headers();
+  headers.set("Accept-Encoding", codexAcceptEncoding);
   applyCodexHeaders(headers, auth, apiKey, stream, ctx.headerPolicy, clientHeaders);
   applyModelHeaderOverrides(headers, model);
   if (prepared.contentType !== "") headers.set("Content-Type", prepared.contentType);
-  return postCodex(ctx, auth, opts, baseURL + endpointPath, headers, requestBodyOf(prepared));
+  return postCodex(ctx, auth, opts, baseURL + endpointPath, headers, requestBodyOf(prepared), false);
 }
 
 /** Responses tool request (Go: the shared head of executeOpenAIImage / executeOpenAIImageStream). */
@@ -660,9 +667,10 @@ async function sendResponsesTool(ctx: CodexImagesContext, auth: Auth, req: ExecR
   const body = prepareCodexOpenAIImageBody(prepared.body, mainModel);
   const { apiKey, baseURL } = codexImageBaseURL(auth);
   const headers = new Headers();
+  headers.set("Accept-Encoding", codexAcceptEncoding);
   applyCodexHeaders(headers, auth, apiKey, true, ctx.headerPolicy, opts.headers);
   applyModelHeaderOverrides(headers, mainModel);
-  const resp = await postCodex(ctx, auth, opts, baseURL + "/responses", headers, body);
+  const resp = await postCodex(ctx, auth, opts, baseURL + "/responses", headers, body, true);
   return { resp, prepared };
 }
 

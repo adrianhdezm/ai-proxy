@@ -1,12 +1,17 @@
 // New (no upstream test): CLI argument parsing, config resolution and the auth list / models / help
 // commands (the login flow is interactive and covered by test/auth/login.test.ts).
-import { afterEach, expect, test } from "bun:test";
+import { afterAll, afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configPathCandidates, describeAuth, main, parseArgs, resolveConfig, usage, type CLIIO } from "../../src/cli.ts";
 import { FileTokenStore } from "../../src/store/index.ts";
 import { testAuth } from "../server/helpers.ts";
+import { logLevel, setLogLevel } from "../../src/log.ts";
+
+// createApp sets the process-wide log level from the config; restore it for later test files.
+const initialLogLevel = logLevel();
+afterAll(() => setLogLevel(initialLogLevel));
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {

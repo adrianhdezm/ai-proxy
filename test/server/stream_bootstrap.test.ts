@@ -174,7 +174,7 @@ describe("handlers_stream_bootstrap_test", () => {
     const { manager } = setup(executor, ["auth1", "auth2"]);
     let failed = false;
     try {
-      const result = await manager.executeStream(["codex"], { model: "test-model", payload: `{"model":"test-model"}`, format: "openai-response" }, { stream: true, metadata: { [PinnedAuthMetadataKey]: "auth1" } });
+      const result = await manager.executeStream(["codex"], { model: "test-model", payload: `{"model":"test-model"}`, format: "openai-response" }, { stream: true, sourceFormat: "openai-response", metadata: { [PinnedAuthMetadataKey]: "auth1" } });
       for await (const chunk of result.chunks) expect(chunk).not.toBe("ok");
     } catch {
       failed = true;
@@ -188,7 +188,7 @@ describe("handlers_stream_bootstrap_test", () => {
     const executor = scripted("codex", () => chunkStream(["ok"]));
     const { manager } = setup(executor, ["auth2"]);
     let selected = "";
-    const result = await manager.executeStream(["codex"], { model: "test-model", payload: `{"model":"test-model"}`, format: "openai-response" }, { stream: true, metadata: { [SelectedAuthCallbackMetadataKey]: (id: string) => (selected = id) } });
+    const result = await manager.executeStream(["codex"], { model: "test-model", payload: `{"model":"test-model"}`, format: "openai-response" }, { stream: true, sourceFormat: "openai-response", metadata: { [SelectedAuthCallbackMetadataKey]: (id: string) => (selected = id) } });
     let got = "";
     for await (const chunk of result.chunks) got += chunk;
     expect(got).toBe("ok");
@@ -330,4 +330,4 @@ test("TestReproPermanentOAuthFailureClassification", async () => {
 
 // Go's SanitizeUpstreamErrorSummary also redacts natural-language secrets ("credential has already been consumed");
 // the manager's sanitizer (src/auth/manager/errors.ts, outside this slice) lacks sanitizerNaturalSecretPattern.
-test.todo("TestReproPermanentOAuthFailureClassification: the terminal OAuth message carries [REDACTED] for the natural-language credential detail");
+test.todo("TestReproPermanentOAuthFailureClassification: the terminal OAuth message carries [REDACTED] for the natural-language credential detail", () => {});

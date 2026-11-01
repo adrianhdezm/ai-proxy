@@ -1,0 +1,20 @@
+{
+  "internal/runtime/executor/gemini_interactions_continuation_test.go": "Tests stateless tool rounds through the Gemini Interactions API translator and executor; the Interactions API is not ported.",
+  "internal/runtime/executor/gemini_interactions_tool_names_test.go": "Tests tool-name mapping between OpenAI chat/Responses and the Gemini Interactions API; the Interactions API is not ported.",
+  "internal/runtime/executor/gemini_interactions_translate_test.go": "Tests TranslateGeminiInteractionsRequestPair and its plugin hooks; the Interactions API and translator plugins are not ported.",
+  "internal/runtime/executor/helps/gemini_interactions_test.go": "Tests SanitizeGeminiInteractionsUnsupportedInputIDs for the public and Vertex Interactions endpoints; the Interactions API and Vertex are not ported.",
+  "internal/runtime/executor/oauth_scope_test.go": "Tests shared Codex multi-agent v2 / orphan-delegation rewrites, xAI x_search injection and API-key scoping of the Codex and xAI auto executors; multi-agent v2, orphan delegation and xAI are not ported.",
+  "internal/runtime/executor/payload_barrier_test.go": "Every case asserts the payload config rules (override/filter/default) applied at the final payload barrier for Codex images, Antigravity, AI Studio relay, xAI and Claude; payload config rules are not ported.",
+  "internal/runtime/executor/payload_review_test.go": "Tests when payload config rule conditions are evaluated (Claude final barrier, AI Studio relay countTokens, Codex duplex steering); payload config rules, the AI Studio relay and duplex websocket steering are not ported.",
+  "internal/runtime/executor/helps/payload_finalizer_test.go": "Tests NewPayloadFinalizer/FinalizePayload (payload config defaults/overrides/filters) and the Devin protobuf payload finalizer; payload config rules and Devin are not ported.",
+  "internal/runtime/executor/helps/cache_helpers_test.go": "Tests SetCodexCacheRequired failing when the Home KV store is unavailable; Home/CLIProxyAPIHome is not ported.",
+  "internal/runtime/executor/helps/logging_helpers_test.go": "Tests RecordAPIRequest/RecordAPIResponseMetadata request logging into the gin context and the upstream-attempt tracker; request logging is not ported.",
+  "internal/runtime/executor/helps/model_capabilities_test.go": "Tests ApplyRequestThinking with Codex configuration_update input items, auth-manager binding of per-credential model capabilities under force-model-prefix, and Home model capabilities; configuration_update handling in the thinking pipeline, prefixed per-key model resolution and Home are not ported.",
+  "internal/runtime/executor/helps/responses_ttft_helpers_test.go": "Tests IsResponsesTokenEvent/ObserveResponsesTokenEvent time-to-first-token classification for usage records; TTFT usage metrics are not ported.",
+  "internal/runtime/executor/helps/transport_cache_test.go": "Tests the LRU cache of Go *http.Transport instances (reuse, eviction, CloseIdleConnections); a Go-only mechanic, Bun's fetch has no transport objects.",
+  "internal/runtime/executor/helps/transport_decorator_test.go": "Tests httptransport client decorators wrapping Go RoundTrippers (plain, Devin, uTLS) and their context isolation; a Go-only mechanic with no Bun fetch equivalent.",
+  "internal/runtime/executor/helps/utls_client_alpn_test.go": "Tests ALPN negotiation of the uTLS fingerprinted client; uTLS fingerprints are Go-only.",
+  "internal/runtime/executor/helps/utls_client_handshake_timeout_test.go": "Tests handshake timeouts of the uTLS fingerprinted client; uTLS fingerprints are Go-only.",
+  "internal/runtime/executor/helps/utls_client_resumption_test.go": "Tests TLS session resumption of the uTLS fingerprinted client; uTLS fingerprints are Go-only.",
+  "internal/runtime/executor/helps/utls_client_test.go": "Tests the uTLS fingerprinted HTTP client (fingerprints, proxies, HTTP/2); uTLS fingerprints are Go-only."
+}

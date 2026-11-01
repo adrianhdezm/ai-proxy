@@ -77,6 +77,8 @@ export {
   isTransientRateLimitError,
   isTransientTransportError,
   isTransientTransportResultError,
+  isTransientRateLimitResultError,
+  isRequestScopedResultError,
   isUnauthorizedError,
   newAuthNotFoundError,
   newAuthUnavailableError,

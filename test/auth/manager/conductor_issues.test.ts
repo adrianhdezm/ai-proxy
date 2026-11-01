@@ -305,7 +305,16 @@ function issue6503Manager(stream: (a: Auth, r: ExecRequest, controller: AbortCon
   const controller = new AbortController();
   const tm = newManager();
   tm.manager.setRetryConfig(0, 0, 0);
-  tm.manager.registerExecutor(fakeExecutor({ identifier: "issue6503", stream: async (a, r) => stream(a, r, controller) as never }));
+  tm.manager.registerExecutor(
+    fakeExecutor({
+      identifier: "issue6503",
+      stream: async (a, r) => stream(a, r, controller) as never,
+      refresh: (a) => {
+        a.metadata.access_token = "refreshed";
+        return a;
+      },
+    }),
+  );
   registerModels(tm.registry, "issue6503-auth", "issue6503", "issue6503-model");
   tm.manager.register(auth({ id: "issue6503-auth", provider: "issue6503", status: StatusActive, metadata }));
   return { tm, controller };

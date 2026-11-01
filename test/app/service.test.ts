@@ -12,7 +12,7 @@
 //   App.stop is the only shutdown path here).
 // Adapted: TestWeightedRoundRobinRoutingSelector checks the strategy normalisation and the selector createApp
 //   installs for it.
-import { afterEach, expect, test } from "bun:test";
+import { afterAll, afterEach, expect, test } from "bun:test";
 import { createApp, newRoutingSelector, type App } from "../../src/app.ts";
 import { FillFirstSelector, RoundRobinSelector, WeightedRoundRobinSelector } from "../../src/auth/manager/index.ts";
 import { newAuth, StatusActive, type Auth } from "../../src/auth/types.ts";
@@ -21,6 +21,11 @@ import type { ApiKeyCredential, Config } from "../../src/config/types.ts";
 import { createExecutors } from "../../src/executor/index.ts";
 import { ModelRegistry } from "../../src/registry/index.ts";
 import type { PersistingTokenStore } from "../../src/store/index.ts";
+import { logLevel, setLogLevel } from "../../src/log.ts";
+
+// createApp sets the process-wide log level from the config; restore it for later test files.
+const initialLogLevel = logLevel();
+afterAll(() => setLogLevel(initialLogLevel));
 
 class MemoryStore implements PersistingTokenStore {
   readonly kind = "memory";

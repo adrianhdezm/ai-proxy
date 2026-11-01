@@ -43,7 +43,7 @@ const toolResultPayload = JSON.stringify({
 async function run(stream: boolean, inputModalities: string[] | undefined): Promise<string> {
   upstream.requests.length = 0;
   upstream.respond(() => (stream ? sseResponse('data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n') : jsonResponse(simpleChatCompletion)));
-  const cfg = configWithModels([modelOverride({ name: "mapped-model", alias: "claude-client", inputModalities })]);
+  const cfg = configWithModels([modelOverride({ name: "mapped-model", alias: "claude-client", inputModalities })], { apiKey: "test", baseUrl: upstream.baseURL });
   const executor = new OpenAICompatExecutor(cfg);
   const auth = apiKeyAuth({ baseURL: upstream.baseURL, apiKey: "test", configIndex: 0 });
   const req = { model: "mapped-model", payload: toolResultPayload, format: FormatClaude };

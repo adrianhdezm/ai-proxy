@@ -112,11 +112,14 @@ export function modelOverride(partial: Partial<CompatModelOverride> & Pick<Compa
   return { alias: "", displayName: "", maxContextLength: 0, isCompat: false, forceMapping: false, ...partial };
 }
 
-/** A config whose single openai API key carries the given model overrides. */
-export function configWithModels(models: CompatModelOverride[]): Config {
+/**
+ * A config whose single openai API key carries the given model overrides. An auth resolves its config entry only
+ * when its API key and base URL match the entry (resolveConfigEntry), so pass the auth's values in `entry`.
+ */
+export function configWithModels(models: CompatModelOverride[], entry: { apiKey?: string; baseUrl?: string } = {}): Config {
   const cfg = defaultConfig();
   cfg.openaiApiKeys = [
-    { apiKey: "test-key", baseUrl: "", models, proxyUrl: "", prefix: "", label: "", headers: {}, priority: 0, excludedModels: [] },
+    { apiKey: entry.apiKey ?? "test-key", baseUrl: entry.baseUrl ?? "", models, proxyUrl: "", prefix: "", label: "", headers: {}, priority: 0, excludedModels: [] },
   ];
   return cfg;
 }

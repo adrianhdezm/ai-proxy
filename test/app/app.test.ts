@@ -1,7 +1,7 @@
 // New (no upstream test): createApp wiring — stored OAuth auths and config API keys are loaded into
 // the manager, their models registered per provider, and /v1/messages routes end to end through
 // fake executors (streaming and non-streaming).
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { applyModelPrefixes, buildConfigModels, createApp, modelsForAuth } from "../../src/app.ts";
 import { AttributeAPIKey, type Auth } from "../../src/auth/types.ts";
 import { defaultConfig } from "../../src/config/load.ts";
@@ -10,6 +10,11 @@ import { StatusError } from "../../src/executor/types.ts";
 import { ModelRegistry, getClaudeModels, getCodexModelsForPlan, getGeminiCLIModels } from "../../src/registry/index.ts";
 import type { PersistingTokenStore } from "../../src/store/index.ts";
 import { chunkStream, fakeExecutor, messagesBody, messagesRequest, testAuth } from "../server/helpers.ts";
+import { logLevel, setLogLevel } from "../../src/log.ts";
+
+// createApp sets the process-wide log level from the config; restore it for later test files.
+const initialLogLevel = logLevel();
+afterAll(() => setLogLevel(initialLogLevel));
 
 class MemoryStore implements PersistingTokenStore {
   readonly kind = "memory";

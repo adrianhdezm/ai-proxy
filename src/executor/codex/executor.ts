@@ -48,8 +48,10 @@
 // is is-compat) and the prompt cache identity is set (prompt_cache.ts: body
 // prompt_cache_key + Session-Id header).
 //
-// Not ported (outside this slice): SIWC credentials and body rules, zstd request
-// compression, multi-agent v2 optimisation, the payload config finalizer, usage
+// Request bodies may go out zstd-compressed (compression.ts, off by default) and
+// labelled upstream responses are decoded there.
+//
+// Not ported (outside this slice): SIWC credentials and body rules, multi-agent v2 optimisation, the payload config finalizer, usage
 // reporting and request logging, the Claude input-token estimate on
 // message_start, and the Home refresh/file-lock path.
 import type { Auth } from "../../auth/types.ts";
@@ -64,7 +66,8 @@ import { getAt, gstr, isObj } from "../../util/gpath.ts";
 import { tryParse } from "../../util/json.ts";
 import { log } from "../../log.ts";
 import { type ExecOptions, type ExecRequest, type ExecResponse, type ProviderExecutor, type StreamResult, StatusError, responseFormatOrSource } from "../types.ts";
-import { applyFetchProxy } from "../proxy.ts";
+import { applyFetchProxy, effectiveProxyURL } from "../proxy.ts";
+import { codexAcceptEncoding, codexRequestWireBody, doCodexRequest, type CodexRequestCompressionPolicy } from "./compression.ts";
 import { codexAuthUsesAPIKey, codexBaseURL, codexCreds, isNativeCodexRequest } from "./creds.ts";
 import {
   type TerminalFailure,
@@ -112,7 +115,7 @@ import { applyCodexHTTPPromptCache } from "./prompt_cache.ts";
 import { type CodexImagesContext, executeCodexOpenAIImage, executeCodexOpenAIImageStream, isCodexOpenAIImageRequest, stripImageGenerationTools } from "./images.ts";
 
 /** Injectable fetch for tests; defaults to the global fetch. */
-export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+export type FetchLike = (input: string, init?: RequestInit & { proxy?: string; decompress?: boolean }) => Promise<Response>;
 
 /** ExecOptions.alt selecting the compaction endpoint (Go: opts.Alt == "responses/compact"). */
 export const CodexCompactAlt = "responses/compact";
@@ -160,6 +163,20 @@ export interface CodexExecutorOptions {
    * no model definition is bound to the request.
    */
   modelOptionsFor?: CodexModelOptionsResolver;
+  /**
+   * Global outbound proxy (Go: requests.proxy-url), used when neither
+   * ExecOptions.proxyUrl nor auth.proxyUrl is set; "direct" / "none" disable proxying.
+   */
+  proxyUrl?: string;
+  /**
+   * codex.upstream-request-compression (default false): zstd-compress request
+   * bodies sent with ChatGPT OAuth credentials to the chatgpt.com Codex backend
+   * (never API keys, custom base URLs or SIWC); a 400/415 answer is retried once
+   * uncompressed. See compression.ts.
+   */
+  upstreamRequestCompression?: boolean;
+  /** codex.upstream-request-compression-min-bytes (default 1024): smaller bodies are sent as is. */
+  upstreamRequestCompressionMinBytes?: number;
 }
 
 interface PreparedRequest {
@@ -250,6 +267,7 @@ export class CodexExecutor implements ProviderExecutor {
 
     const url = baseURL.replace(/\/+$/, "") + "/responses";
     const headers = new Headers();
+    headers.set("Accept-Encoding", codexAcceptEncoding);
     if (cache.sessionID !== "") headers.set("Session-Id", cache.sessionID);
     applyCodexHeaders(headers, auth, apiKey, true, { disableCloaking: this.options.disableCloaking, headerDefaults: this.options.headerDefaults }, opts.headers);
     applyCodexRoutingHint(headers, auth, baseModel, body, opts.headers);
@@ -257,10 +275,16 @@ export class CodexExecutor implements ProviderExecutor {
     return { url, headers, body, originalPayload, from, responseFormat, preserveNativeOutput, replayScope: replay.scope };
   }
 
+  /** The request compression policy (Go: cfg.Codex.UpstreamRequestCompression / RequestCompressionMinBytes). */
+  get compressionPolicy(): CodexRequestCompressionPolicy {
+    return { enabled: this.options.upstreamRequestCompression === true, minBytes: this.options.upstreamRequestCompressionMinBytes };
+  }
+
+  /** Sends the prepared request, zstd-compressed when eligible (Go: cacheHelper + doCodexRequest). */
   private async send(auth: Auth, prepared: PreparedRequest, opts: ExecOptions): Promise<Response> {
-    const init: RequestInit & { proxy?: string } = { method: "POST", headers: prepared.headers, body: prepared.body, signal: opts.signal };
-    applyFetchProxy(init, opts.proxyUrl, auth.proxyUrl, undefined);
-    return this.fetchFn(prepared.url, init);
+    const init = applyFetchProxy<{ headers: Headers; signal?: AbortSignal; proxy?: string }>({ headers: prepared.headers, signal: opts.signal }, opts.proxyUrl, auth.proxyUrl, this.options.proxyUrl);
+    const wire = codexRequestWireBody(this.compressionPolicy, auth, prepared.url, prepared.body);
+    return doCodexRequest(this.fetchFn, prepared.url, init, prepared.body, wire);
   }
 
   /** Reads a rejected response and classifies it (Go: newCodexStatusErrWithHeadersAndCooling). */
@@ -278,7 +302,14 @@ export class CodexExecutor implements ProviderExecutor {
 
   /** What the image endpoints borrow from this executor (images.ts). */
   private imagesContext(): CodexImagesContext {
-    return { fetch: this.fetchFn, now: this.now, modelLevelCooling: this.modelLevelCooling, headerPolicy: { disableCloaking: this.options.disableCloaking, headerDefaults: this.options.headerDefaults } };
+    return {
+      fetch: this.fetchFn,
+      now: this.now,
+      modelLevelCooling: this.modelLevelCooling,
+      headerPolicy: { disableCloaking: this.options.disableCloaking, headerDefaults: this.options.headerDefaults },
+      proxyUrl: this.options.proxyUrl,
+      compression: this.compressionPolicy,
+    };
   }
 
   async execute(auth: Auth, req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
@@ -503,6 +534,7 @@ export class CodexExecutor implements ProviderExecutor {
 
     const url = baseURL.replace(/\/+$/, "") + "/responses/compact";
     const headers = new Headers();
+    headers.set("Accept-Encoding", codexAcceptEncoding);
     if (cache.sessionID !== "") headers.set("Session-Id", cache.sessionID);
     applyCodexHeaders(headers, auth, apiKey, false, { disableCloaking: this.options.disableCloaking, headerDefaults: this.options.headerDefaults }, opts.headers);
     applyCodexRoutingHint(headers, auth, baseModel, body, opts.headers);
@@ -567,7 +599,8 @@ export class CodexExecutor implements ProviderExecutor {
   async refresh(auth: Auth): Promise<Auth> {
     log.debug("codex executor: refresh called");
     if (codexAuthUsesAPIKey(auth)) return auth;
-    return new CodexAuthenticator().refresh(auth, { fetch: this.options.fetch, now: this.options.now });
+    const proxyUrl = effectiveProxyURL(undefined, auth.proxyUrl, this.options.proxyUrl);
+    return new CodexAuthenticator().refresh(auth, { fetch: this.options.fetch, now: this.options.now, ...(proxyUrl !== "" ? { proxyUrl } : {}) });
   }
 }
 

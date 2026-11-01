@@ -42,12 +42,13 @@ describe("payload mutations", () => {
 test("TestApplyThinkingWithSourcePayloadPreservesOriginalOnlySummary", () => {
   // The working payload has no reasoning summary; the original request disabled it (summary:null), so the Gemini body
   // must carry includeThoughts=false. Go called ApplyThinkingWithSourcePayload directly on a pre-built body; here the
-  // same inputs go through the executor's translateToGemini (Responses -> Gemini translation + thinking).
-  const current = `{"model":"gemini-3.6-flash","reasoning":{"effort":"high"},"input":"hi"}`;
+  // same inputs go through the executor's translateToGemini, with the thinking level supplied as a model suffix.
+  const current = `{"model":"gemini-3.6-flash","input":"hi"}`;
   const original = `{"model":"gemini-3.6-flash","reasoning":{"summary":null},"input":"hi"}`;
-  const out = translateToGemini({ model: "gemini-3.6-flash", payload: current, format: "openai-response" }, { stream: false, sourceFormat: "openai-response", originalRequest: original }, false, "aistudio");
-  const include = JSON.parse(out).generationConfig?.thinkingConfig?.includeThoughts;
-  expect(include).toBe(false);
+  const out = translateToGemini({ model: "gemini-3.6-flash(high)", payload: current, format: "openai-response" }, { stream: false, sourceFormat: "openai-response", originalRequest: original }, false, "aistudio");
+  const thinking = JSON.parse(out).generationConfig?.thinkingConfig;
+  expect(thinking?.thinkingLevel).toBe("high");
+  expect(thinking?.includeThoughts).toBe(false);
 });
 
 test("TestGenerateFakeUserIDUsesClaudeCode220JSONShape", () => {

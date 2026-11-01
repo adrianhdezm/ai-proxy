@@ -98,5 +98,5 @@ describe("executors pass the effective proxy to fetch", () => {
     expect(f.proxies).toEqual([requestProxy, authProxy, undefined]);
   });
 
-  test.todo("Codex: the global proxy (requests.proxy-url) applies when the credential has none (CodexExecutorOptions has no global proxy and createExecutors does not pass it; needs src/executor/codex and src/executor/index.ts changes)");
+  test.todo("Codex: the global proxy (requests.proxy-url) applies when the credential has none (CodexExecutorOptions has no global proxy and createExecutors does not pass it; needs src/executor/codex and src/executor/index.ts changes)", () => {});
 });
