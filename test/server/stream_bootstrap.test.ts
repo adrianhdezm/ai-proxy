@@ -316,6 +316,7 @@ test("TestReproPermanentOAuthFailureClassification", async () => {
       expect(payload.error.code).toBe("upstream_authentication_required");
       expect(payload.error.retryable).toBe(false);
       expect(payload.error.message).toContain("refresh_token_reused");
+      expect(payload.error.message).toContain("[REDACTED]");
     }
     expect(calls).toBe(0);
 
@@ -328,6 +329,3 @@ test("TestReproPermanentOAuthFailureClassification", async () => {
   }
 });
 
-// Go's SanitizeUpstreamErrorSummary also redacts natural-language secrets ("credential has already been consumed");
-// the manager's sanitizer (src/auth/manager/errors.ts, outside this slice) lacks sanitizerNaturalSecretPattern.
-test.todo("TestReproPermanentOAuthFailureClassification: the terminal OAuth message carries [REDACTED] for the natural-language credential detail", () => {});

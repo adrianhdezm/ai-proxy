@@ -19,7 +19,12 @@ import { accessTokenExpirationTime } from "./classification.ts";
 
 /** Picks one candidate among the available auths (Go: Selector). */
 export interface Selector {
-  pick(provider: string, model: string, opts: ExecOptions, auths: Auth[], nowMs: number): Auth;
+  /**
+   * `modelFor` maps a candidate to the model its availability is checked
+   * against (prefix stripped, OAuth alias resolved; Go: selectionModelForAuth);
+   * `model` itself keys the rotation state and error messages.
+   */
+  pick(provider: string, model: string, opts: ExecOptions, auths: Auth[], nowMs: number, modelFor?: (auth: Auth) => string): Auth;
 }
 
 export type BlockReason = "none" | "cooldown" | "disabled" | "other";
@@ -195,14 +200,14 @@ function causeFromAuthError(err: AuthError | undefined): Error | undefined {
  * TerminalAuthError when every candidate is terminally unauthorized and an
  * auth_unavailable error otherwise (Go: availableAuthsForRouteModelWithPriorityMode).
  */
-export function getAvailableAuths(auths: Auth[], provider: string, model: string, nowMs: number): Auth[] {
+export function getAvailableAuths(auths: Auth[], provider: string, model: string, nowMs: number, modelFor?: (auth: Auth) => string): Auth[] {
   if (auths.length === 0) throw newAuthNotFoundError("no auth candidates");
   const buckets = new Map<number, Auth[]>();
   let cooldownCount = 0;
   let unauthorizedCount = 0;
   let earliest = 0;
   for (const candidate of auths) {
-    const block = isAuthBlockedForModel(candidate, model, nowMs);
+    const block = isAuthBlockedForModel(candidate, modelFor ? modelFor(candidate) : model, nowMs);
     if (!block.blocked) {
       const priority = authPriority(candidate);
       const bucket = buckets.get(priority);
@@ -257,8 +262,8 @@ export class RoundRobinSelector implements Selector {
     this.maxKeys = options.maxKeys && options.maxKeys > 0 ? options.maxKeys : 4096;
   }
 
-  pick(provider: string, model: string, _opts: ExecOptions, auths: Auth[], nowMs: number): Auth {
-    const available = getAvailableAuths(auths, provider, model, nowMs);
+  pick(provider: string, model: string, _opts: ExecOptions, auths: Auth[], nowMs: number, modelFor?: (auth: Auth) => string): Auth {
+    const available = getAvailableAuths(auths, provider, model, nowMs, modelFor);
     const key = `${provider}:${canonicalModelKey(model)}`;
     if (!this.lastPicked.has(key) && this.lastPicked.size >= this.maxKeys) this.lastPicked = new Map();
     const picked = available[successorIndex(available, this.lastPicked.get(key) ?? "")]!;
@@ -274,8 +279,8 @@ export class RoundRobinSelector implements Selector {
 
 /** Always selects the first available credential by id (Go: FillFirstSelector). */
 export class FillFirstSelector implements Selector {
-  pick(provider: string, model: string, _opts: ExecOptions, auths: Auth[], nowMs: number): Auth {
-    return getAvailableAuths(auths, provider, model, nowMs)[0]!;
+  pick(provider: string, model: string, _opts: ExecOptions, auths: Auth[], nowMs: number, modelFor?: (auth: Auth) => string): Auth {
+    return getAvailableAuths(auths, provider, model, nowMs, modelFor)[0]!;
   }
 }
 
@@ -444,8 +449,8 @@ export class WeightedRoundRobinSelector implements Selector {
     this.maxKeys = options.maxKeys && options.maxKeys > 0 ? options.maxKeys : 4096;
   }
 
-  pick(provider: string, model: string, _opts: ExecOptions, auths: Auth[], nowMs: number): Auth {
-    const available = getAvailableAuths(positiveWeightAuths(auths), provider, model, nowMs);
+  pick(provider: string, model: string, _opts: ExecOptions, auths: Auth[], nowMs: number, modelFor?: (auth: Auth) => string): Auth {
+    const available = getAvailableAuths(positiveWeightAuths(auths), provider, model, nowMs, modelFor);
     const key = `${provider}:${canonicalModelKey(model)}`;
     if (!this.states.has(key) && this.states.size >= this.maxKeys) this.states = new Map();
     let state = this.states.get(key);

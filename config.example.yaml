@@ -16,6 +16,10 @@ server:
   port: 8317
   # Maximum inbound request body size in bytes. 0 disables the limit.
   max-request-body-bytes: 0
+  # Compress responses (zstd or gzip) when the client advertises support; SSE is flushed per event.
+  response-compression:
+    enabled: true
+    min-bytes: 1024
 
 # Inbound authentication: clients must present one of these keys
 # (x-api-key header or Authorization: Bearer).

@@ -5,12 +5,12 @@
 // ExecuteStream / ExecuteCount / executeMixedOnce), conductor_stream.go,
 // conductor_cooldown.go (MarkResult, ResetQuota) and conductor_refresh.go.
 //
-// API-key model aliases and routing prefixes are resolved per credential
+// Routing prefixes, OAuth model aliases and API-key model aliases are resolved per credential
 // before the executor runs (models.ts); the weighted selector is chosen from
 // routing.strategy when a config is supplied.
 //
 // Dropped from upstream: Home mode, plugin schedulers, session affinity,
-// OAuth model aliases, OpenAI-compatibility alias pools, request interceptors,
+// OpenAI-compatibility alias pools, force-mapping response rewriting, request interceptors,
 // RequestAuthPreparer, antigravity credits fallback, Home execution-session auths, SIWC,
 // Devin quota revalidation, cooldown state stores and registration epochs.
 import {
@@ -82,7 +82,7 @@ import {
   type RefreshLeadResolver,
   type RefreshTimers,
 } from "./refresh.ts";
-import { attachResolvedAPIKeyModelInfo, compileAPIKeyModelAlias, configuredModelOverrides, lookupAPIKeyUpstreamModel, resolveAPIKeyModelAliasWithResult, resolveExecutionModel, type ModelAliasResult } from "./models.ts";
+import { applyOAuthModelAlias, attachResolvedAPIKeyModelInfo, compileAPIKeyModelAlias, rewriteModelForAuth, configuredModelOverrides, lookupAPIKeyUpstreamModel, resolveAPIKeyModelAliasWithResult, resolveExecutionModel, type ModelAliasResult } from "./models.ts";
 import { FillFirstSelector, RoundRobinSelector, WeightedRoundRobinSelector, availabilityBlock, isAuthBlockedForModel, validateAuthWeight, type BlockState, type Selector } from "./selector.ts";
 import {
   clearCooldownStateForAuth,
@@ -701,7 +701,7 @@ export class AuthManager {
       candidates.push(candidate);
     }
     if (candidates.length === 0) throw newAuthNotFoundError();
-    const selected = this.selector.pick("mixed", model, opts, candidates, this.now());
+    const selected = this.selector.pick("mixed", model, opts, candidates, this.now(), (auth) => this.selectionModelForAuth(auth, model));
     const providerKey = executorKeyFromAuth(selected);
     const executor = this.executors.get(providerKey);
     if (!executor) throw new AuthManagerError("executor_not_found", "executor not registered");
@@ -812,11 +812,12 @@ export class AuthManager {
     let minWait = 0;
     for (const auth of this.retryCandidates(providers, model, pinned)) {
       if (attempt >= this.effectiveRequestRetryLimit(auth, defaultRequestRetry)) continue;
-      const { eligible, next } = this.retryRoundAvailabilityForAuth(auth, model, now);
+      const selectionModel = this.selectionModelForAuth(auth, model);
+      const { eligible, next } = this.retryRoundAvailabilityForAuth(auth, selectionModel, now);
       if (!eligible) continue;
       const wasAttempted = attempted?.has(auth.id) ?? false;
       const coolingDisabled = this.cooldownDisabledForAuth(auth);
-      const transientZeroWait = !this.hasLiveQuotaCooldown(auth, model, now) && this.hasTransientZeroWaitEligibility(auth, model);
+      const transientZeroWait = !this.hasLiveQuotaCooldown(auth, selectionModel, now) && this.hasTransientZeroWaitEligibility(auth, selectionModel);
       if (!wasAttempted || coolingDisabled || status !== 429 || transientZeroWait) {
         if (next === 0) return { wait: 0, found: true };
         const wait = next - now;
@@ -841,7 +842,7 @@ export class AuthManager {
     const now = this.now();
     for (const auth of this.retryCandidates(providers, model, pinned)) {
       if (attempt >= this.effectiveRequestRetryLimit(auth, defaultRequestRetry)) continue;
-      if (this.retryRoundAvailabilityForAuth(auth, model, now).eligible) return true;
+      if (this.retryRoundAvailabilityForAuth(auth, this.selectionModelForAuth(auth, model), now).eligible) return true;
     }
     return false;
   }
@@ -977,7 +978,7 @@ export class AuthManager {
       notifySelectedAuth(opts, auth.id);
       tried.add(auth.id);
       round.attempted.add(auth.id);
-      const resultModel = canonicalModelKey(routeModel);
+      const resultModel = this.stateModelForExecution(auth, routeModel);
       let stamp = this.dispatchStamp(auth);
       let errExec: unknown;
       let resp: ExecResponse | undefined;
@@ -1051,6 +1052,26 @@ export class AuthManager {
     return execReq;
   }
 
+  /** The model availability is tracked under for this credential: prefix stripped, OAuth alias resolved (Go: selectionModelForAuth). */
+  selectionModelForAuth(auth: Auth, routeModel: string): string {
+    let requested = rewriteModelForAuth(routeModel ?? "", auth);
+    if (requested.trim() === "") requested = (routeModel ?? "").trim();
+    const resolved = applyOAuthModelAlias(this.config, auth, requested);
+    return resolved.trim() !== "" ? resolved : requested;
+  }
+
+  /**
+   * The model state key an execution result is recorded under: the upstream
+   * model when it is the selection model (prefix/OAuth alias), otherwise the
+   * route model (Go: stateModelForExecution without pools).
+   */
+  stateModelForExecution(auth: Auth, routeModel: string): string {
+    const upstream = resolveExecutionModel(this.config, auth, routeModel);
+    const selection = this.selectionModelForAuth(auth, routeModel);
+    if (selection.trim() !== "" && canonicalModelKey(selection) === canonicalModelKey(upstream)) return canonicalModelKey(upstream);
+    return canonicalModelKey(routeModel);
+  }
+
   /** The upstream model this credential serves for `routeModel` (Go: ResolveExecutionModel). */
   resolveExecutionModel(auth: Auth, routeModel: string): string {
     return resolveExecutionModel(this.config, auth, routeModel);
@@ -1105,7 +1126,7 @@ export class AuthManager {
       notifySelectedAuth(opts, auth.id);
       tried.add(auth.id);
       round.attempted.add(auth.id);
-      const resultModel = canonicalModelKey(routeModel);
+      const resultModel = this.stateModelForExecution(auth, routeModel);
       let stamp = this.dispatchStamp(auth);
       let errStream: unknown;
       let started: Awaited<ReturnType<typeof readStreamBootstrap>> | undefined;
@@ -1181,7 +1202,7 @@ export class AuthManager {
     if (this.isStaleExecutionResult(result, auth)) return;
     const now = this.now();
     let modelKey = canonicalModelKey(result.model ?? "");
-    if (modelKey === "" && result.routeModel) modelKey = canonicalModelKey(result.routeModel);
+    if (modelKey === "" && result.routeModel) modelKey = canonicalModelKey(this.selectionModelForAuth(auth, result.routeModel));
     const resultErr = result.error;
     const executionSeq = result.executionSeq ?? 0;
     const rejectsToken =

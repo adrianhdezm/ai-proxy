@@ -47,7 +47,7 @@ The API key is one of the values under `access.api-keys` in `config.yaml`. With 
 | `POST /v1/images/generations`, `POST /v1/images/edits` | OpenAI image endpoints (Codex and OpenAI credentials) |
 | `GET /v1/models`, `GET /v1/models/:id` | Models served by the loaded credentials; OpenAI list shape for OpenAI and Codex clients |
 | `GET /v0/usage` | Usage statistics, when enabled |
-| `GET /health` | Health check |
+| `GET /health`, `GET /healthz` | Health check |
 
 Claude endpoints answer errors in the Anthropic error format and OpenAI endpoints in the OpenAI one. Inbound keys are accepted as `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or `?key=`.
 
@@ -92,7 +92,9 @@ bun run src/index.ts auth migrate --from file --to vault
 
 ## Routing and failover
 
-Each request goes to a credential that serves the requested model. Credentials in a higher `priority` tier are used first, and within a tier the proxy rotates round-robin, or fill-first if configured.
+Each request goes to a credential that serves the requested model. Credentials in a higher `priority` tier are used first. Within a tier, `routing.strategy` picks `round-robin` (default), `weighted-round-robin` (by each credential's `weight`) or `fill-first`.
+
+Model aliases from `oauth-model-alias`, per-credential `model_aliases` and the `models` lists of API-key entries are resolved to the upstream model before a request is sent, and a routing `prefix` is stripped.
 
 On failure the proxy moves to the next credential and cools the failed one down:
 
@@ -107,7 +109,7 @@ OAuth tokens refresh in the background before they expire.
 
 ## Optional behaviour
 
-These follow upstream and are off by default; see `config.example.yaml`.
+These follow upstream and are off by default; see `config.example.yaml`. Response compression (zstd or gzip, negotiated with the client) is on by default as upstream; set `server.response-compression.enabled: false` to turn it off.
 
 | Setting | Effect |
 |---|---|
@@ -115,6 +117,7 @@ These follow upstream and are off by default; see `config.example.yaml`.
 | `upstream.claude.tool-search` | Maps Responses-client `tool_search` to Anthropic native tool search. |
 | `client.codex.web-search-result-cache` | Keeps web search results for Responses clients that replay searches without them. |
 | `observability.usage.usage-statistics-enabled` | Records per-request usage, readable at `GET /v0/usage`. |
+| `upstream.codex.upstream-request-compression` | zstd-compresses request bodies sent to the ChatGPT Codex backend, as the official client does. |
 | `multimedia.disable-image-generation` | Turns the image endpoints off and keeps the `image_generation` tool out of Codex requests. |
 
 **Websockets.** Codex clients can open a websocket on `GET /v1/responses` and keep a multi-turn session on it. When a Codex credential sets `websockets: true` (on its `codex-api-key` entry or in its auth file), websocket clients also reach the Codex backend over one reused upstream websocket. HTTP clients always use HTTP. Duplex response steering is not implemented.

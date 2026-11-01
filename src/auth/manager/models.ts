@@ -7,11 +7,14 @@
 // the configured-capability lookup of api_key_model_capabilities.go
 // (attachResolvedAPIKeyModelInfo).
 //
-// Dropped from upstream: OAuth model aliases (oauth-model-alias is not a config
-// section here), OpenAI-compatibility alias pools, Home dispatch models and the
-// force-mapping response rewriter.
+// OAuth model aliases (oauth-model-alias per channel plus the per-auth
+// model_aliases) are resolved here too (Go: oauth_model_alias.go).
+//
+// Dropped from upstream: OpenAI-compatibility alias pools, Home dispatch
+// models and the force-mapping response rewriter.
 import type { ExecRequest } from "../../executor/types.ts";
-import type { ApiKeyCredential, Config, ModelOverride } from "../../config/types.ts";
+import { sanitizeOAuthModelAlias } from "../../config/load.ts";
+import type { ApiKeyCredential, Config, ModelOverride, OAuthModelAlias } from "../../config/types.ts";
 import { resolveModelInfo } from "../../registry/model_config.ts";
 import type { ModelInfo } from "../../registry/types.ts";
 import { parseSuffix } from "../../thinking/suffix.ts";
@@ -216,10 +219,102 @@ export function applyAPIKeyModelAlias(cfg: Config | undefined, auth: Auth | unde
   return resolved !== "" ? resolved : requested;
 }
 
-/** The upstream model an execution sends for `routeModel` on this credential (Go: ResolveExecutionModel, API-key half). */
+// ---------------------------------------------------------------------------
+// OAuth model aliases (Go: oauth_model_alias.go)
+// ---------------------------------------------------------------------------
+
+/** Attribute (JSON) / metadata key holding per-auth OAuth model aliases (Go: oauthModelAliasesAttributeKey). */
+export const OAuthModelAliasesAttributeKey = "model_aliases";
+
+/**
+ * The oauth-model-alias channel of a credential: "" for API keys, otherwise the
+ * lower-cased provider, with the Gemini CLI OAuth provider ("gemini") on the
+ * "gemini-cli" channel its models are registered under (Go: OAuthModelAliasChannel).
+ */
+export function oauthModelAliasChannel(auth: Auth | undefined): string {
+  if (!auth || authKind(auth) === AuthKindAPIKey) return "";
+  const provider = (auth.provider ?? "").trim().toLowerCase();
+  if (provider === "gemini") return "gemini-cli";
+  return provider;
+}
+
+/** Sanitized per-auth aliases from the `model_aliases` attribute (JSON) or metadata (Go: OAuthModelAliasesFromAttributes). */
+export function oauthModelAliasesFromAuth(auth: Auth | undefined): OAuthModelAlias[] {
+  if (!auth) return [];
+  let raw: unknown = auth.metadata?.[OAuthModelAliasesAttributeKey];
+  const attr = (auth.attributes?.[OAuthModelAliasesAttributeKey] ?? "").trim();
+  if (attr !== "") {
+    try {
+      raw = JSON.parse(attr);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(raw)) return [];
+  const entries = raw
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item))
+    .map((item) => ({
+      name: typeof item.name === "string" ? item.name : "",
+      alias: typeof item.alias === "string" ? item.alias : "",
+      fork: item.fork === true,
+      displayName: typeof item["display-name"] === "string" ? (item["display-name"] as string) : "",
+      forceMapping: item["force-mapping"] === true || item.force_mapping === true || item.forceMapping === true,
+    }));
+  return sanitizeOAuthModelAlias({ auth: entries }).auth ?? [];
+}
+
+/**
+ * Alias lookup over one alias list: exact (suffixed) alias first, then the
+ * suffix-free one. originalAlias is the client-visible model kept for responses
+ * (Go: resolveUpstreamModelFromAliases / resolveUpstreamModelFromAliasTable).
+ */
+export function resolveUpstreamModelFromAliases(aliases: ReadonlyArray<OAuthModelAlias>, requestedModel: string): ModelAliasResult {
+  if (aliases.length === 0) return emptyAliasResult();
+  const { result, candidates } = modelAliasLookupCandidates(requestedModel);
+  if (candidates.length === 0) return emptyAliasResult();
+  const baseModel = result.modelName === "" ? requestedModel.trim() : result.modelName;
+  for (const candidate of candidates) {
+    const key = candidate.trim();
+    if (key === "") continue;
+    for (const entry of aliases) {
+      const original = (entry.name ?? "").trim();
+      const alias = (entry.alias ?? "").trim();
+      if (original === "" || alias === "" || !equalFold(alias, key) || equalFold(original, alias)) continue;
+      if (equalFold(original, baseModel)) {
+        if (!entry.forceMapping) return emptyAliasResult();
+        return { upstreamModel: preserveResolvedModelSuffix(original, result), forceMapping: true, originalAlias: alias };
+      }
+      return { upstreamModel: preserveResolvedModelSuffix(original, result), forceMapping: entry.forceMapping === true, originalAlias: entry.forceMapping ? alias : requestedModel };
+    }
+  }
+  return emptyAliasResult();
+}
+
+/** Per-auth aliases win over the channel's global aliases; "" upstream when none applies (Go: resolveOAuthModelAliasWithResult). */
+export function resolveOAuthModelAliasWithResult(cfg: Config | undefined, auth: Auth | undefined, requestedModel: string): ModelAliasResult {
+  const channel = oauthModelAliasChannel(auth);
+  if (channel === "") return emptyAliasResult();
+  const perAuth = resolveUpstreamModelFromAliases(oauthModelAliasesFromAuth(auth), requestedModel);
+  if (perAuth.upstreamModel !== "") return perAuth;
+  const global = sanitizeOAuthModelAlias(cfg?.oauthModelAlias ?? {})[channel] ?? [];
+  return resolveUpstreamModelFromAliases(global, requestedModel);
+}
+
+/** The upstream model of an OAuth alias, or the requested model unchanged (Go: applyOAuthModelAlias). */
+export function applyOAuthModelAlias(cfg: Config | undefined, auth: Auth | undefined, requestedModel: string): string {
+  const upstream = resolveOAuthModelAliasWithResult(cfg, auth, requestedModel).upstreamModel;
+  return upstream === "" ? requestedModel : upstream;
+}
+
+/**
+ * The upstream model an execution sends for `routeModel` on this credential:
+ * routing prefix stripped, then the OAuth alias, then the API-key alias
+ * (Go: executionModelCandidates / ResolveExecutionModel without pools or Home).
+ */
 export function resolveExecutionModel(cfg: Config | undefined, auth: Auth | undefined, routeModel: string): string {
   const route = (routeModel ?? "").trim();
-  const requested = rewriteModelForAuth(route, auth);
+  let requested = rewriteModelForAuth(route, auth);
+  requested = applyOAuthModelAlias(cfg, auth, requested);
   const resolved = applyAPIKeyModelAlias(cfg, auth, requested);
   return resolved.trim() !== "" ? resolved : route;
 }

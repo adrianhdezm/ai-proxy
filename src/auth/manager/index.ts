@@ -178,7 +178,13 @@ export {
 export { StreamBootstrapError, readStreamBootstrap, streamErrorResult, unwrapStreamBootstrapError, wrapStreamResult } from "./stream.ts";
 export {
   ResolvedAPIKeyModelInfoMetadataKey,
+  OAuthModelAliasesAttributeKey,
   applyAPIKeyModelAlias,
+  applyOAuthModelAlias,
+  oauthModelAliasChannel,
+  oauthModelAliasesFromAuth,
+  resolveOAuthModelAliasWithResult,
+  resolveUpstreamModelFromAliases,
   attachResolvedAPIKeyModelInfo,
   compileAPIKeyModelAlias,
   configuredModelOverrides,

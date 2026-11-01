@@ -154,8 +154,8 @@ test("createApp routes /v1/messages through the executors end to end", async () 
     // ends with an api_error frame.
     const aliased = await app.fetch(messagesRequest("team/codex-fast", false, { headers: { "x-api-key": "sk-proxy" } }));
     expect(aliased.status).toBe(200);
-    // The manager strips the routing prefix (and, with its config wired, resolves the alias to gpt-5.4).
-    expect(["codex-fast", "gpt-5.4"]).toContain(codex.executeCalls[0]!.model);
+    // The manager strips the routing prefix and resolves the alias to the upstream model.
+    expect(codex.executeCalls[0]!.model).toBe("gpt-5.4");
     const truncated = await app.fetch(messagesRequest("codex-fast", true, { headers: { "x-api-key": "sk-proxy" } }));
     expect(truncated.status).toBe(200);
     const truncatedText = await truncated.text();

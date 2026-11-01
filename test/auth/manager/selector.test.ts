@@ -1,6 +1,6 @@
 // Ported from: sdk/cliproxy/auth/selector_test.go
 // Skipped cases: TestWeightedRoundRobinSelectorPick_* / TestAuthWeight_* / TestPickSmoothWeightedAuth_* /
-// TestSmoothWeightedStatePrepare_* (weighted selector not ported), TestRoundRobinSelectorPick_Concurrent
+// TestSmoothWeightedStatePrepare_* (ported in weight.test.ts), TestRoundRobinSelectorPick_Concurrent
 // (goroutine race; single threaded here), TestExtractSessionID* / TestSessionAffinitySelector* /
 // TestSessionCache* / TestExtractExplicitSessionIDs_* (session affinity not ported),
 // TestManagerSetSelector* (selector swapping not ported).

@@ -1,5 +1,5 @@
 // Ported from: sdk/cliproxy/auth/conductor_stream_quota_test.go
-// Skipped cases: the weighted=true sub-cases (weighted selector not ported).
+// Skipped cases: the weighted=true sub-cases (the weighted selector is covered by weight.test.ts).
 import { expect, test } from "bun:test";
 import { RoundRobinSelector, isAuthBlockedForModel } from "../../../src/auth/manager/index.ts";
 import { Hour, Minute, auth, drain, fakeExecutor, newManager, opts, registerModels, req, statusError, streamOf } from "./helpers.ts";
