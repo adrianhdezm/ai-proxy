@@ -1,0 +1,7 @@
+{
+  "internal/runtime/executor/claude_effort_directive_test.go": "Tests relocation of OAuth caller system prompts into mid-conversation role=system turns around effort directives (insertClaudeMidConversationSystemMessages, captureClaudeCodeSystemPlacement), a cloaking step this port does not implement: caller system prompts stay in the top-level system field.",
+  "internal/runtime/executor/claude_executor_auth_race_test.go": "Goroutine data-race checks on a shared credential's metadata map during the OAuth profile prefetch (PrepareRequestAuth), a Go-only concurrency mechanic for a hook this port does not have.",
+  "internal/runtime/executor/claude_tls_handshake_retry_test.go": "Drives the Go uTLS client through a silent CONNECT proxy with a configured TLS handshake timeout, a Go transport mechanic (uTLS and tls-handshake-timeout-seconds) not ported.",
+  "internal/runtime/executor/helps/claude_credential_identity_race_test.go": "Goroutine race checks on concurrent ApplyClaudeCredentialMetadata over one shared Auth map, a Go-only concurrency mechanic.",
+  "internal/runtime/executor/helps/claude_json_prefilter_fuzz_test.go": "Go fuzz test comparing the jsonMayContainASCII byte pre-filter against a gjson reference; this port parses JSON before classifying, so there is no pre-filter."
+}
