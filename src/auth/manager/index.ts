@@ -64,6 +64,8 @@ export {
   isCredentialRetryRoundStatus,
   isCredentialScopedError,
   isExplicitModelNotFoundError,
+  isExplicitModelNotFoundErrorForModel,
+  isCountTokensEndpointNotFoundError,
   isInvalidGrantError,
   isInvalidGrantResultError,
   isModelSupportError,

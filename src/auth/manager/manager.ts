@@ -54,6 +54,7 @@ import {
   ErrorCodeForceCooldown,
   errorStatus,
   isAbortError,
+  isCountTokensEndpointNotFoundError,
   isCredentialScopedError,
   isInvalidGrantError,
   isInvalidGrantResultError,
@@ -924,7 +925,7 @@ export class AuthManager {
   /** Token counting with the same selection and failover rules (Go: ExecuteCount). */
   executeCount(providers: string[], req: ExecRequest, opts: ExecOptions): Promise<ExecResponse> {
     return this.runRounds(providers, req, opts, (round, attempt, snapshot) =>
-      this.executeOnce(normalizeProviders(providers), req, opts, snapshot.maxRetryCredentials, attempt, snapshot.requestRetry, round, (executor, auth, execReq) => executor.countTokens(auth, execReq, opts)),
+      this.executeOnce(normalizeProviders(providers), req, opts, snapshot.maxRetryCredentials, attempt, snapshot.requestRetry, round, (executor, auth, execReq) => executor.countTokens(auth, execReq, opts), (err, routeModel) => isCountTokensEndpointNotFoundError(err, routeModel)),
     );
   }
 
@@ -953,6 +954,7 @@ export class AuthManager {
     defaultRequestRetry: number,
     round: RoundState,
     invoke: (executor: ProviderExecutor, auth: Auth, req: ExecRequest) => Promise<ExecResponse>,
+    availabilityNeutral?: (err: unknown, routeModel: string) => boolean,
   ): Promise<ExecResponse> {
     const routeModel = authSelectionModelFromOptions(opts, req.model);
     this.prepareOptions(opts, routeModel);
@@ -1008,7 +1010,8 @@ export class AuthManager {
         this.markResult({ authId: auth.id, provider, model: resultModel, routeModel, success: true, ...stamp });
         return resp!;
       }
-      this.markFailure(auth.id, provider, resultModel, routeModel, errExec, stamp);
+      // A count_tokens route missing on the gateway says nothing about the credential (Go: recordAvailabilityNeutralResult).
+      if (!availabilityNeutral?.(errExec, routeModel)) this.markFailure(auth.id, provider, resultModel, routeModel, errExec, stamp);
       // The upstream failure is recorded even when the client went away (Go: issue #6503).
       if (opts.signal?.aborted) throw abortReason(opts.signal);
       if (isRequestInvalidError(errExec)) throw errExec;

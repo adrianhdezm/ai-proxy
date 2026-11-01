@@ -623,6 +623,13 @@ const sanitizers: Array<[RegExp, string]> = [
   [/\bauthorization\s*[:=]\s*[^\r\n]+/gi, "Authorization: [REDACTED]"],
   [/\b(?:sk-[A-Za-z0-9._~+/=-]{6,}|ghp_[A-Za-z0-9._~+/=-]{6,})\b/g, "sk-[REDACTED]"],
   [/\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]"],
+  // Go: sanitizerInvalidTokenPattern ("invalid api key sk-...").
+  [/\b(invalid|bad|expired|unknown)\s+(?:api\s+key|access\s+token|refresh\s+token|token|key|secret|password|credentials?|bearer)\s*(?:[:= ]\s*)?(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,\r\n;]+)/gi, "$1 token [REDACTED]"],
+  // Go: sanitizerNaturalSecretPattern ("credential has already been consumed", "api key is abc").
+  [
+    /\b([A-Za-z0-9_.-]*(?:api[ _-]?key|access[ _-]?token|client[ _-]?secret|private[ _-]?key|secret[ _-]?key|password|secret|token|credentials?|sessionid))\s*(?:(?:is|was|provided|used)?\s*[:= ]\s*|\s+is\s+|\s+was\s+|\s+provided\s+|\s+)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:[^\r\n;,|]+?(?:\s+(?:and|with|for|via)\s+|[,;|]|\r|\n|$)|[^\r\n;,|]+))/gi,
+    "$1: [REDACTED]",
+  ],
   [/((?:'|")?(?:[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|credentials?|sessionid))(?:'|")?\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;|\r\n]+)/gi, "$1[REDACTED]"],
   [/(^|[\s("'`=\[])(\/(?:[^/\s"'`,;:()\[\]<>]+\/)*[^/\s"'`,;:()\[\]<>]+\.(?:json|yaml|yml|key|pem|txt|log|toml|conf|env|crt|cer))/g, "$1[REDACTED_PATH]"],
   [/\b[A-Za-z]:\\[^\r\n:,;'"<>]+/g, "[REDACTED_PATH]"],
@@ -703,4 +710,161 @@ export function safeResponseHeaders(err: unknown): Headers | undefined {
     return new Headers({ "Retry-After": String(seconds) });
   }
   return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Explicit model-not-found detection (Go: isExplicitModelNotFoundError with a
+// requested model, containsStructuredModelNotFound, isCountTokensEndpointNotFoundError)
+// ---------------------------------------------------------------------------
+
+function isModelNotFoundIdentifier(value: string): boolean {
+  let candidate = value.trim().toLowerCase();
+  const fragment = candidate.lastIndexOf("#");
+  if (fragment >= 0 && fragment + 1 < candidate.length) {
+    candidate = candidate.slice(fragment + 1);
+  } else {
+    const query = candidate.indexOf("?");
+    if (query >= 0) candidate = candidate.slice(0, query);
+    candidate = candidate.replace(/\/+$/, "");
+    const separator = Math.max(candidate.lastIndexOf("/"), candidate.lastIndexOf(":"));
+    if (separator >= 0) candidate = candidate.slice(separator + 1);
+  }
+  const normalized = candidate.replace(/[- ]/g, "_");
+  return ["model_not_found", "model_not_found_error", "unknown_model", "model_does_not_exist", "model_not_exist"].includes(normalized);
+}
+
+function isNotFoundErrorIdentifier(value: string): boolean {
+  const normalized = value.trim().toLowerCase().replace(/[- ]/g, "_");
+  return normalized === "not_found" || normalized === "not_found_error";
+}
+
+function trimEdges(value: string): string {
+  return value.trim().toLowerCase().replace(/^[ .!;\t\r\n]+|[ .!;\t\r\n]+$/g, "");
+}
+
+function hasWordPrefix(lower: string, prefix: string): boolean {
+  return lower === prefix || lower.startsWith(prefix + " ") || lower.startsWith(prefix + ":");
+}
+
+function afterPrefix(lower: string, prefix: string): string {
+  let remainder = lower.slice(prefix.length).trim();
+  if (remainder.startsWith(":")) remainder = remainder.slice(1).trim();
+  return remainder;
+}
+
+function trimRequestedModelReference(value: string, requestedModel: string): { suffix: string; matches: boolean } {
+  const model = requestedModel.trim().toLowerCase();
+  if (model === "") return { suffix: "", matches: false };
+  for (const candidate of [model, `'${model}'`, `"${model}"`, "`" + model + "`"]) {
+    if (value === candidate) return { suffix: "", matches: true };
+    if (!value.startsWith(candidate)) continue;
+    const remainder = value.slice(candidate.length);
+    if (remainder === "" || " :,".includes(remainder[0]!)) return { suffix: remainder.replace(/^[ :,]+/, ""), matches: true };
+  }
+  return { suffix: "", matches: false };
+}
+
+function isMissingModelPhrase(value: string): boolean {
+  const trimmed = value.replace(/^[ .!;\t\r\n]+|[ .!;\t\r\n]+$/g, "");
+  return ["not found", "was not found", "could not be found", "does not exist", "doesn't exist", "not exist", "is unknown", "does not exist or you do not have access to it"].includes(trimmed);
+}
+
+const modelPrefixes = ["the requested model", "requested model", "the model", "model"];
+
+function isExplicitModelNotFoundMessage(message: string, requestedModel: string): boolean {
+  const lower = trimEdges(message);
+  if (lower === "") return false;
+  if (lower.includes("in request") || lower.includes("in body") || lower.includes("request body")) return false;
+  const normalized = lower.replace(/-/g, "_");
+  if (normalized.includes("model_not_found") || normalized.includes("unknown_model")) return true;
+  for (const prefix of ["no such model", "unknown model"]) {
+    if (!hasWordPrefix(lower, prefix)) continue;
+    const remainder = afterPrefix(lower, prefix);
+    if (remainder === "") return true;
+    const { suffix, matches } = trimRequestedModelReference(remainder, requestedModel);
+    return matches && suffix === "";
+  }
+  for (const prefix of modelPrefixes) {
+    if (!hasWordPrefix(lower, prefix)) continue;
+    const remainder = afterPrefix(lower, prefix);
+    if (isMissingModelPhrase(remainder)) return true;
+    const { suffix, matches } = trimRequestedModelReference(remainder, requestedModel);
+    return matches && isMissingModelPhrase(suffix);
+  }
+  return false;
+}
+
+function isExactRequestedModelReference(message: string, requestedModel: string): boolean {
+  const lower = trimEdges(message);
+  for (const prefix of modelPrefixes) {
+    if (!hasWordPrefix(lower, prefix)) continue;
+    const { suffix, matches } = trimRequestedModelReference(afterPrefix(lower, prefix), requestedModel);
+    return matches && suffix === "";
+  }
+  return false;
+}
+
+function containsStructuredModelNotFound(value: unknown, requestedModel: string): boolean {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === "string" && isExplicitModelNotFoundMessage(item, requestedModel)) return true;
+      if (containsStructuredModelNotFound(item, requestedModel)) return true;
+    }
+    return false;
+  }
+  if (!value || typeof value !== "object") return false;
+  let notFoundType = false;
+  let exactModelReference = false;
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof item === "string") {
+      switch (key.trim().toLowerCase()) {
+        case "code":
+          if (isModelNotFoundIdentifier(item)) return true;
+          break;
+        case "type":
+          if (isModelNotFoundIdentifier(item)) return true;
+          notFoundType = notFoundType || isNotFoundErrorIdentifier(item);
+          break;
+        case "error":
+        case "message":
+        case "detail":
+        case "error_description":
+        case "title":
+          if (isExplicitModelNotFoundMessage(item, requestedModel)) return true;
+          exactModelReference = exactModelReference || isExactRequestedModelReference(item, requestedModel);
+          break;
+      }
+    } else if (item && typeof item === "object" && containsStructuredModelNotFound(item, requestedModel)) {
+      return true;
+    }
+  }
+  return notFoundType && exactModelReference;
+}
+
+function isStructuredModelNotFoundError(message: string, requestedModel: string): boolean {
+  try {
+    return containsStructuredModelNotFound(JSON.parse(message.trim()), requestedModel);
+  } catch {
+    return false;
+  }
+}
+
+/** A structured "this model does not exist" rejection for `requestedModel`, following causes (Go: isExplicitModelNotFoundError). */
+export function isExplicitModelNotFoundErrorForModel(err: unknown, requestedModel: string): boolean {
+  if (err === undefined || err === null) return false;
+  if (err instanceof AuthManagerError && isModelNotFoundIdentifier(err.code)) return true;
+  if (isStructuredModelNotFoundError(errorText(err), requestedModel)) return true;
+  if (err instanceof AggregateError) return err.errors.some((nested) => isExplicitModelNotFoundErrorForModel(nested, requestedModel));
+  if (err instanceof Error && err.cause !== undefined && err.cause !== err) return isExplicitModelNotFoundErrorForModel(err.cause, requestedModel);
+  return false;
+}
+
+/**
+ * A 404 from count_tokens that names no missing model: the gateway lacks the
+ * endpoint, so the failure must not suspend the model (Go: isCountTokensEndpointNotFoundError).
+ */
+export function isCountTokensEndpointNotFoundError(err: unknown, requestedModel: string): boolean {
+  if (err === undefined || err === null || errorStatus(err) !== 404) return false;
+  const baseModel = requestedModel.replace(/\([^()]*\)$/, "");
+  return !isExplicitModelNotFoundErrorForModel(err, baseModel);
 }
