@@ -60,7 +60,14 @@ export function defaultConfig(): Config {
     requests: { proxyUrl: "", passthroughHeaders: false, requestRetry: DefaultRequestRetry },
     quotaExceeded: { switchProject: true, switchPreviewModel: true },
     upstream: {
-      codex: { disableCloaking: false, streamBootstrapBuffering: false, streamBootstrapTimeoutMs: 0, modelLevelCooling: false },
+      codex: {
+        disableCloaking: false,
+        streamBootstrapBuffering: false,
+        streamBootstrapTimeoutMs: 0,
+        modelLevelCooling: false,
+        upstreamRequestCompression: false,
+        upstreamRequestCompressionMinBytes: 1024,
+      },
       claude: { modelLevelCooling: false, disableCloakMode: false, sessionDatePinDays: 7, toolSearch: false },
     },
     usage: { statisticsEnabled: false },
@@ -230,6 +237,8 @@ export function parseConfig(text: string, options: LoadOptions = {}): Config {
   cfg.upstream.codex.streamBootstrapBuffering = bool(codex["stream-bootstrap-buffering"], "upstream.codex.stream-bootstrap-buffering", false);
   cfg.upstream.codex.streamBootstrapTimeoutMs = durationMs(codex["stream-bootstrap-timeout"], "upstream.codex.stream-bootstrap-timeout", 0);
   cfg.upstream.codex.modelLevelCooling = bool(codex["model-level-cooling"], "upstream.codex.model-level-cooling", false);
+  cfg.upstream.codex.upstreamRequestCompression = bool(codex["upstream-request-compression"], "upstream.codex.upstream-request-compression", false);
+  cfg.upstream.codex.upstreamRequestCompressionMinBytes = int(codex["upstream-request-compression-min-bytes"], "upstream.codex.upstream-request-compression-min-bytes", 1024);
   const claude = section(upstream, "claude");
   cfg.upstream.claude.modelLevelCooling = bool(claude["model-level-cooling"], "upstream.claude.model-level-cooling", false);
   cfg.upstream.claude.disableCloakMode = bool(claude["disable-claude-cloak-mode"], "upstream.claude.disable-claude-cloak-mode", false);

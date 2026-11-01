@@ -98,5 +98,15 @@ describe("executors pass the effective proxy to fetch", () => {
     expect(f.proxies).toEqual([requestProxy, authProxy, undefined]);
   });
 
-  test.todo("Codex: the global proxy (requests.proxy-url) applies when the credential has none (CodexExecutorOptions has no global proxy and createExecutors does not pass it; needs src/executor/codex and src/executor/index.ts changes)", () => {});
+  test("Codex: the global proxy (requests.proxy-url) applies when the credential has none", async () => {
+    const completed = `data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n`;
+    const f = capturingFetch(() => new Response(completed, { headers: { "Content-Type": "text/event-stream" } }));
+    const exec = new CodexExecutor({ fetch: f.fetch as never, proxyUrl: "http://global.proxy:8080" });
+    const auth = (proxyUrl?: string) => newAuth({ id: "x", provider: "codex", proxyUrl, attributes: { api_key: "k", base_url: "http://upstream.invalid" } });
+    const req = { model: "gpt-5", payload: `{"model":"gpt-5","input":"hi"}`, format: "openai-response" as const };
+    await exec.execute(auth(), req, { stream: false, sourceFormat: "openai-response" });
+    await exec.execute(auth("http://auth.proxy:1"), req, { stream: false, sourceFormat: "openai-response" });
+    await exec.execute(auth("direct"), req, { stream: false, sourceFormat: "openai-response" });
+    expect(f.proxies).toEqual(["http://global.proxy:8080", "http://auth.proxy:1", undefined]);
+  });
 });

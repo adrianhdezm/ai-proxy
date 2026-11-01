@@ -53,7 +53,7 @@ function compressed(encoding: string, plain: string | Uint8Array): Uint8Array {
   const data = bytesOf(plain);
   switch (encoding) {
     case "gzip":
-      return Bun.gzipSync(data);
+      return Bun.gzipSync(data as Uint8Array<ArrayBuffer>);
     case "br":
       return new Uint8Array(zlib.brotliCompressSync(data));
     case "zstd":

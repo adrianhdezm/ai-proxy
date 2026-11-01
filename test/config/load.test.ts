@@ -372,7 +372,7 @@ observability:
 multimedia:
   disable-image-generation: true
 `);
-  expect(cfg.upstream.codex).toEqual({ disableCloaking: true, streamBootstrapBuffering: true, streamBootstrapTimeoutMs: 80_000, modelLevelCooling: true });
+  expect(cfg.upstream.codex).toMatchObject({ disableCloaking: true, streamBootstrapBuffering: true, streamBootstrapTimeoutMs: 80_000, modelLevelCooling: true });
   expect(cfg.upstream.claude).toEqual({ modelLevelCooling: false, disableCloakMode: true, sessionDatePinDays: 3, toolSearch: true });
   expect(cfg.usage.statisticsEnabled).toBe(true);
   expect(cfg.multimedia.disableImageGeneration).toBe(true);
@@ -414,4 +414,16 @@ codex-api-key:
   const byKey = (k: string) => auths.find((a) => a.attributes.api_key === k)!;
   expect(byKey("c1").attributes.websockets).toBe("true");
   expect(byKey("c2").attributes.websockets).toBeUndefined();
+});
+
+test("upstream.codex request compression", () => {
+  const cfg = parseConfig(`
+upstream:
+  codex:
+    upstream-request-compression: true
+    upstream-request-compression-min-bytes: 2048
+`);
+  expect(cfg.upstream.codex.upstreamRequestCompression).toBe(true);
+  expect(cfg.upstream.codex.upstreamRequestCompressionMinBytes).toBe(2048);
+  expect(parseConfig("").upstream.codex.upstreamRequestCompression).toBe(false);
 });

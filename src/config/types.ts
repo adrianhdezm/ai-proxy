@@ -115,6 +115,10 @@ export interface CodexUpstreamConfig {
   streamBootstrapTimeoutMs: number;
   /** Scope usage_limit_reached cooldowns to the requested model (model-level-cooling). */
   modelLevelCooling: boolean;
+  /** zstd-compress request bodies to the ChatGPT Codex backend (OAuth only; upstream-request-compression). */
+  upstreamRequestCompression?: boolean;
+  /** Bodies smaller than this are sent uncompressed (upstream-request-compression-min-bytes, default 1024). */
+  upstreamRequestCompressionMinBytes?: number;
 }
 
 /** upstream.claude: Claude executor behaviour shared by OAuth and API-key credentials. */

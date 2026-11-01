@@ -98,6 +98,10 @@ upstream:
     # Optional ceiling for that hold-back (e.g. "20s"); "0" = frame/byte budgets only.
     # Recommended behind reverse proxies with short read timeouts.
     stream-bootstrap-timeout: "0"
+    # zstd-compress request bodies sent to the ChatGPT Codex backend (OAuth credentials only),
+    # as the official Codex client does; a 400/415 rejection is retried once uncompressed.
+    upstream-request-compression: false
+    upstream-request-compression-min-bytes: 1024
     # Cool only the requested model on usage_limit_reached instead of the whole account.
     model-level-cooling: false
     # Websockets: Codex clients may open a websocket on GET /v1/responses (same API keys).
