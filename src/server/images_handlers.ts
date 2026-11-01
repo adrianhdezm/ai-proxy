@@ -111,12 +111,22 @@ function errorTypeAndCode(status: number): { type: string; code?: string } {
  * JSON body without an `error` object is wrapped (its message / detail string
  * becomes the message) so clients always get the OpenAI envelope.
  */
+/** Whether the error or any cause is a terminal credential failure (Go: errors.As on the wrapped chain). */
+function hasTerminalAuthCause(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  for (let current = err; current instanceof Error && !seen.has(current); current = current.cause) {
+    seen.add(current);
+    if (current instanceof TerminalAuthError) return true;
+  }
+  return false;
+}
+
 export function openAIErrorBody(status: number, errText: string, err?: unknown): string {
   if (status <= 0) status = 500;
   if (errText.trim() === "") errText = httpStatusText(status) || "Internal Server Error";
   const trimmed = errText.trim();
   const parsed = tryParse(trimmed);
-  if (err instanceof TerminalAuthError) {
+  if (hasTerminalAuthCause(err)) {
     let message = errText;
     if (isObject(parsed)) {
       if (typeof parsed.message === "string" && parsed.message !== "") message = parsed.message;

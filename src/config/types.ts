@@ -53,11 +53,7 @@ export interface AuthConfig {
   vault: VaultConfig;
 }
 
-/**
- * Credential selection strategy (upstream routing.strategy). "weighted-round-robin" is
- * accepted for config compatibility; the manager has no weighted selector yet, so it
- * runs as round-robin.
- */
+/** Credential selection strategy (upstream routing.strategy; "wrr" and "ff" are accepted spellings). */
 export type RoutingStrategy = "round-robin" | "fill-first" | "weighted-round-robin";
 
 export interface RetryConfig {

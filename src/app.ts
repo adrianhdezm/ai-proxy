@@ -22,8 +22,7 @@ import {
   AuthManager,
   authKind,
   AuthKindAPIKey,
-  FillFirstSelector,
-  RoundRobinSelector,
+  selectorForStrategy,
   setQuotaCooldownDisabled,
   setTransientErrorCooldownSeconds,
   type AutoRefreshLoop,
@@ -130,6 +129,7 @@ export async function createApp(config: Config, options: AppOptions = {}): Promi
     cooldownDisabled: config.routing.cooldown.disabled,
     refreshLead: (auth) => loginManager.refreshLead(auth.provider),
     selector: newRoutingSelector(config.routing.strategy),
+    config,
   });
   manager.setRetryConfig(config.routing.retry.maxAttempts, config.routing.retry.maxRetryIntervalSeconds * 1000, config.routing.retry.maxRetryCredentials);
 
@@ -193,20 +193,9 @@ export async function createApp(config: Config, options: AppOptions = {}): Promi
   };
 }
 
-/**
- * The credential selector for routing.strategy (Go: newRoutingSelector). The manager has
- * no weighted selector, so "weighted-round-robin" runs as round-robin.
- */
+/** The credential selector for routing.strategy (Go: newRoutingSelector, session affinity dropped). */
 export function newRoutingSelector(strategy: RoutingStrategy): Selector {
-  switch (strategy) {
-    case "fill-first":
-      return new FillFirstSelector();
-    case "weighted-round-robin":
-      log.warn("routing.strategy weighted-round-robin is not supported; using round-robin");
-      return new RoundRobinSelector();
-    default:
-      return new RoundRobinSelector();
-  }
+  return selectorForStrategy(strategy);
 }
 
 // ---------------------------------------------------------------------------

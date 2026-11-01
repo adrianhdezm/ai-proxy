@@ -81,11 +81,16 @@ export function isClaudeTitleHelperRequest(payload: Payload): boolean {
   return false;
 }
 
+/** A title-schema request also counts when a turn carries the <session> transcript (Go: isClaudeTitleHelperInstruction). */
+function matchesTitlePrompt(text: string): boolean {
+  return matchesSystemTitleInstruction(text) || text.includes("<session>");
+}
+
 function isClaudeTitleHelperInstruction(root: unknown): boolean {
   const system = getAt(root, "system");
   if (Array.isArray(system)) {
-    for (const part of system) if (matchesSystemTitleInstruction(gstr(getAt(part, "text")))) return true;
-  } else if (typeof system === "string" && matchesSystemTitleInstruction(system)) {
+    for (const part of system) if (matchesTitlePrompt(gstr(getAt(part, "text")))) return true;
+  } else if (typeof system === "string" && matchesTitlePrompt(system)) {
     return true;
   }
   const messages = getAt(root, "messages");
@@ -93,8 +98,8 @@ function isClaudeTitleHelperInstruction(root: unknown): boolean {
     for (const msg of messages) {
       const content = getAt(msg, "content");
       if (Array.isArray(content)) {
-        for (const part of content) if (matchesSystemTitleInstruction(gstr(getAt(part, "text")))) return true;
-      } else if (matchesSystemTitleInstruction(gstr(content))) {
+        for (const part of content) if (matchesTitlePrompt(gstr(getAt(part, "text")))) return true;
+      } else if (matchesTitlePrompt(gstr(content))) {
         return true;
       }
     }

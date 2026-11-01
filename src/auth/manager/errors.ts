@@ -558,6 +558,7 @@ export function isRequestScopedResultError(err: AuthError | undefined): boolean 
 export function isTransientTransportResultError(err: AuthError | undefined): boolean {
   if (!err) return false;
   if (err.code === ErrorCodeTransientTransport) return true;
+  if (err.code === ErrorCodeConnectionLifecycle) return false;
   if (statusCodeFromResult(err) !== 0) return false;
   // Matching text alone must not promote a handshake-timeout phrase (Go: isTransientTransportResultError).
   if (err.message.toLowerCase().includes("tls handshake timeout")) return false;

@@ -27,9 +27,30 @@ export function stableUUIDFromSeed(seed: string): string {
   return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20, 32)}`;
 }
 
+/** The RFC 4122 namespace Go uses for synthesized CLI identities (Go: claudeCLIIdentityNamespace). */
+const claudeCLIIdentityNamespace = "6ba7b812-9dad-11d1-80b4-00c04fd430c8";
+
+/** A name-based SHA-1 UUID (version 5), as uuid.NewSHA1 builds it. */
+export function uuidV5(namespace: string, name: string): string {
+  const ns = Uint8Array.from(namespace.replace(/-/g, "").match(/../g)!.map((h) => parseInt(h, 16)));
+  const hasher = new Bun.CryptoHasher("sha1");
+  hasher.update(ns);
+  hasher.update(name);
+  const b = new Uint8Array(hasher.digest()).slice(0, 16);
+  b[6] = (b[6]! & 0x0f) | 0x50;
+  b[8] = (b[8]! & 0x3f) | 0x80;
+  const hex = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 /** Stable synthesized account UUID for credentials without a real one (Go: StableClaudeCLIAccountUUID). */
 export function stableClaudeCLIAccountUUID(seed: string): string {
-  return stableUUIDFromSeed("cli-proxy-api\x00claude\x00account-uuid\x00" + seed);
+  return uuidV5(claudeCLIIdentityNamespace, "cpa-claude-code-cli-account|" + seed);
+}
+
+/** Stable synthesized device id (Go: StableClaudeCLIDeviceID). */
+export function stableClaudeCLIDeviceID(seed: string): string {
+  return sha256Hex("cpa-claude-code-cli-device|" + seed);
 }
 
 /** A stable credential identity that does not rotate with access tokens (Go: ClaudeCLIAuthIdentitySeed). */
@@ -137,12 +158,14 @@ export function applyClaudeCLIIdentity(body: string, auth: Auth, seed: string, s
   if (!isObj(root)) throw new StatusError(400, "apply Claude credential metadata: request must be a JSON object", { requestScoped: true });
   let target = auth;
   if (synthesize) {
+    // Synthesized identity goes on a clone so the shared credential is not mutated
+    // (Go: PrepareClaudeCLIFingerprintAuth / EnsureClaudeCLIFingerprintIdentity).
     target = cloneAuth(auth);
-    const identitySeed = claudeCLIAuthIdentitySeed(auth) || seed;
-    if (!Array.isArray(target.metadata.claude_device_ids) || target.metadata.claude_device_ids.length === 0) {
-      target.metadata.claude_device_ids = [sha256Hex("cli-proxy-api\x00claude\x00device-id\x00" + identitySeed)];
-    }
+    const identitySeed = seed.trim() !== "" ? seed.trim() : "anonymous";
     if (claudeCredentialAccountUUID(target) === "") target.metadata.account_uuid = stableClaudeCLIAccountUUID(identitySeed);
+    if (!Array.isArray(target.metadata.claude_device_ids) || target.metadata.claude_device_ids.length === 0) {
+      target.metadata.claude_device_ids = [stableClaudeCLIDeviceID(identitySeed)];
+    }
   }
   const { deviceIDs } = ensureDeviceIDPool(target.metadata);
   const deviceID = selectDeviceID(deviceIDs, sessionID);
